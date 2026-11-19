@@ -537,9 +537,17 @@ class InstallTest(Case):
 
     def test_update_refuses_git_checkout(self) -> None:
         self.remote.write_bytes(with_version("99.0.0"))
-        result = self.update(SCRIPT)
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("git pull", json.loads(result.stdout)["error"])
+        for kind in ("dir", "file"):  # a clone has a .git folder, a worktree a .git file
+            with self.subTest(kind):
+                checkout = self.root / f"checkout-{kind}"
+                (checkout / "sub").mkdir(parents=True)
+                (checkout / ".git").mkdir() if kind == "dir" else (checkout / ".git").write_text("gitdir: x\n")
+                script = checkout / "sub/cpu-tune"
+                script.write_bytes(SCRIPT.read_bytes())
+                result = self.update(script)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("git pull", json.loads(result.stdout)["error"])
+                self.assertEqual(script.read_bytes(), SCRIPT.read_bytes())
 
     def test_version(self) -> None:
         version = re.search(r'^__version__ = "([^"]+)"', SCRIPT.read_text(), re.M)[1]
