@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
-__version__ = "2.4.1"  # increase it for every change: "cputune update" compares versions
+__version__ = "2.4.2"  # increase it for every change: "cputune update" compares versions
 
 # The latest release, not main: raw.githubusercontent.com caches main for 5 minutes, and a
 # release exists only after the tests passed on main.
@@ -474,7 +474,11 @@ def load_state() -> dict:
         return {"cpus": {}, "boost": {}}
     except (OSError, ValueError) as e:
         die(f"cannot read {STATE_SHOWN}: {e}. Delete it with: sudo rm {STATE_SHOWN}")
-    if not isinstance(state.get("cpus"), dict) or not isinstance(state.get("boost"), dict):
+    cpus = state.get("cpus") if isinstance(state, dict) else None
+    if not (isinstance(cpus, dict) and isinstance(state.get("boost"), dict) and all(
+        cpu.isdigit() and isinstance(saved, dict) and isinstance(saved.get("min"), int)
+        and isinstance(saved.get("max"), int) for cpu, saved in cpus.items()
+    )):
         die(f"{STATE_SHOWN} is damaged. Delete it with: sudo rm {STATE_SHOWN}")
     return state
 
@@ -500,15 +504,15 @@ def measure(cpus: list[int], seconds: float = 1.0) -> dict[int, int]:
     """
     samples = 5
     interval = 0 if TEST_MODE else seconds / samples
-    sums = dict.fromkeys(cpus, 0)
+    values: dict[int, list[int]] = {cpu: [] for cpu in cpus}
     for i in range(samples):
         if i:
             time.sleep(interval)
         for cpu in cpus:
             d = fdir(cpu)
-            value = read_int(d / "cpuinfo_avg_freq") or read_int(d / "scaling_cur_freq") or 0
-            sums[cpu] += value
-    return {cpu: total // samples // 1000 for cpu, total in sums.items()}
+            if khz := read_int(d / "cpuinfo_avg_freq") or read_int(d / "scaling_cur_freq"):
+                values[cpu].append(khz)
+    return {cpu: sum(v) // len(v) // 1000 if v else 0 for cpu, v in values.items()}
 
 
 def measure_under_load(cpus: list[int]) -> dict[int, int]:
@@ -1198,6 +1202,8 @@ def parse_freq(text: str) -> int | str:
     if t in ("base", "min", "max"):
         return t
     if m := re.fullmatch(r"(\d+(?:\.\d+)?)(ghz|mhz|g|m)?", t):
+        if "." in m[1] and not m[2]:  # MHz have no decimals: 2.4 is 2.4 GHz, not 2 MHz
+            raise argparse.ArgumentTypeError(f'bad frequency "{text}". Did you mean {m[1]}GHz?')
         return round(float(m[1]) * (1000 if m[2] in ("ghz", "g") else 1))
     raise argparse.ArgumentTypeError(
         f'bad frequency "{text}". Examples: 2400, 2400MHz, 2.4GHz, base, min, max'
@@ -1245,7 +1251,17 @@ def cmd_lock(args: argparse.Namespace) -> None:
                     "lock turns boost off, so it can lock at most the base frequency."
                 )
     save_state(cpus, args.exclusive)
+    try:
+        cores, scope, governors = lock_cpus(cpus, freq)
+    except Error as e:
+        end = "" if str(e).endswith((".", "?")) else "."
+        die(f"{e}{end} Settings are partly changed. Undo with: cputune reset")
+    report_lock(args, cpus, cores, scope, governors)
 
+
+def lock_cpus(cpus: list[int], freq: int | str) -> tuple[list[dict], str, set[str]]:
+    """Boost off, then minimum = maximum = target. Returns the measured cores, the boost scope
+    ("core", "global" or "none") and the governors."""
     # 1. Boost off. The hardware range can get smaller with it, so this comes first.
     switches = {}
     for cpu in cpus:
@@ -1258,12 +1274,7 @@ def cmd_lock(args: argparse.Namespace) -> None:
         warn("no boost switch found, boost stays as it is")
 
     # 2. Check all targets. The range is checked again, because boost is off now.
-    targets = {}
-    for cpu in cpus:
-        try:
-            targets[cpu] = lowest_lock_khz(cpu) if freq == "min" else target_khz(cpu, freq, clamp=False)
-        except Error as e:
-            die(f"{e} Boost is off now. Undo with: cputune reset")
+    targets = {cpu: lowest_lock_khz(cpu) if freq == "min" else target_khz(cpu, freq, clamp=False) for cpu in cpus}
 
     # 3. The performance governor, so the core does not drop below the minimum.
     # 4. Minimum = maximum = target.
@@ -1293,7 +1304,10 @@ def cmd_lock(args: argparse.Namespace) -> None:
         elif not ok:
             warn(f"cpu{cpu}: measured {got} MHz under load, faster than the lock {want} MHz. "
                  "Boost is still on, or the CPU does not go this low.")
+    return cores, scope, governors
 
+
+def report_lock(args: argparse.Namespace, cpus: list[int], cores: list[dict], scope: str, governors: set[str]) -> None:
     # A benchmark runs on the CPUs that the user named, as with taskset. The lock covers the
     # whole physical core, because SMT siblings share one frequency. Without --cpu: all of it.
     pin = cpus if args.cpu is None or args.cpu.strip() == "all" else sorted(set(parse_cpu_list(args.cpu)))
@@ -1478,8 +1492,18 @@ def cmd_run(args: argparse.Namespace) -> None:
     if args.cpu is not None:
         lock += ["--cpu", args.cpu]
 
+    def stop(signum, frame):
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGHUP, stop)
     existed = state_exists()
-    result = run_root(lock, capture=True)
+    try:
+        result = run_root(lock, capture=True)
+    except BaseException:  # Ctrl+C or SIGTERM while lock runs: undo what it changed
+        if not existed and state_exists():
+            run_root(["reset", "--json", "--color=never"], capture=True)
+        raise
     try:
         locked = json.loads(result.stdout)
     except ValueError:
@@ -1502,9 +1526,11 @@ def cmd_run(args: argparse.Namespace) -> None:
     cores = locked["cores"]
     pin = locked.get("pin_cpus", cpus)
     unverified = [c for c in cores if not c["ok"]]
-    for core in unverified:
-        problems.append(f"cpu {format_cpu_list(core['cpus'])}: measured {core['measured_mhz'] or '?'} MHz "
-                        f"under load, faster than the lock {core['target_mhz']} MHz")  # lock warned already
+    for core in unverified:  # lock warned already
+        where = format_cpu_list(core["cpus"])
+        problems.append(f"cpu {where}: measured {core['measured_mhz']} MHz under load, faster than the lock "
+                        f"{core['target_mhz']} MHz" if core["measured_mhz"] else
+                        f"cpu {where}: cannot measure the frequency under load")
     if args.strict and unverified:
         reset()
         die(f"the lock is not verified: {'; '.join(problems[-len(unverified):])}. "
@@ -1520,11 +1546,6 @@ def cmd_run(args: argparse.Namespace) -> None:
                     GRAY)
         )
 
-    def stop(signum, frame):
-        raise SystemExit(128 + signum)
-
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGHUP, stop)
     # 3. Run the command on the pinned CPUs. Meanwhile, cputune samples the frequency from other CPUs.
     groups = [[cpu for cpu in core["cpus"] if cpu in pin] for core in cores]  # where the command runs
     throttled_before = [throttle_count(core["cpus"][0]) for core in cores]
@@ -1566,7 +1587,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         changed = [path for path, value in settings.items() if read_str(Path(path)) != value]
         if changed:
             problem("another program changed the lock while the command ran: "
-                    f"{', '.join(changed)}. Check with: cputune check")
+                    f"{', '.join(changed)}. Check with: cputune")
         for core, group, before in zip(cores, groups, throttled_before):
             values = [mhz for cpu in group for mhz in samples[cpu]]
             core["run_avg_mhz"] = round(sum(values) / len(values)) if values else None
@@ -1712,11 +1733,11 @@ def render_sudoers(status: dict) -> list[str]:
     return lines
 
 
-def sudoers_install(status: dict) -> list[str]:
+def sudoers_install(status: dict, no_check: bool = False) -> list[str]:
     """Install the root-owned copy when it is missing or old, then the checked rule. Returns what it did."""
     done = []
     if not status["installed"] or status["outdated"]:
-        target, version, origin, notes = install_copy(system=True, no_check=False)
+        target, version, origin, notes = install_copy(system=True, no_check=no_check)
         done += [f"Installed cputune {version} from {origin} to {target}", *notes]
     if status["works"]:
         return done
@@ -1748,7 +1769,8 @@ def cmd_sudoers(args: argparse.Namespace) -> None:
         return
     legacy_note()
     if args.install:
-        done = [] if status["works"] and not status["outdated"] else sudoers_install(status)
+        no_check = getattr(args, "no_check", False)  # install --no-password --no-check
+        done = [] if status["works"] and not status["outdated"] else sudoers_install(status, no_check)
         status = sudoers_status()
         if status["works"] is False:
             warn("the rule is installed, but sudo still asks for a password. "

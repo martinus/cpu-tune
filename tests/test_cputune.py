@@ -126,6 +126,17 @@ class ShowTest(Case):
         self.assertEqual(cores[(8, 9)]["base_mhz"], 2200)  # Intel base_frequency, P-core
         self.assertEqual(cores[(16,)]["base_mhz"], 1600)  # E-core
 
+    def test_measure_skips_failed_reads(self) -> None:
+        with mock.patch.dict(os.environ, CPUTUNE_ROOT=str(self.root)):
+            m = load_module()
+        # cpuinfo_avg_freq fails, and scaling_cur_freq fails once in 5 samples: the average is 4000, not 3200.
+        cur = iter([4000000, None, 4000000, 4000000, 4000000])
+        read_int = lambda path: next(cur) if path.name == "scaling_cur_freq" else None  # noqa: E731
+        with mock.patch.object(m, "read_int", read_int):
+            self.assertEqual(m.measure([8]), {8: 4000})
+        with mock.patch.object(m, "read_int", lambda path: None):
+            self.assertEqual(m.measure([8]), {8: 0})
+
     def test_now_and_widths(self) -> None:
         for columns in (40, 80, 250):
             result = self.run_tool("show", "--now", "--color", "always", columns=columns)
@@ -305,6 +316,7 @@ class ShowTest(Case):
         self.assertIn("outside 800-5500", self.fails("lock", "9999").stderr)
         self.assertIn("above the base frequency 2200", self.fails("lock", "3000").stderr)
         self.assertIn("Did you mean 2GHz?", self.fails("lock", "2").stderr)
+        self.assertIn('bad frequency "2.4". Did you mean 2.4GHz?', self.fails("lock", "2.4", code=2).stderr)
         self.assertEqual(self.snapshot(), before)
         self.assertFalse(self.state.exists())
 
@@ -491,6 +503,14 @@ class ResetTest(Case):
     def test_damaged_state(self) -> None:
         self.state.write_text("{not json")
         self.assertIn("sudo rm /run/cputune.json", self.fails("reset").stderr)
+        # Valid JSON, but not a state: an error message, not a traceback.
+        for text in ("[]", '{"cpus": {"x": {}}, "boost": {}}', '{"cpus": {"8": {"min": "1"}}, "boost": {}}'):
+            with self.subTest(state=text):
+                self.state.write_text(text)
+                result = self.fails("reset")
+                self.assertIn("/run/cputune.json is damaged", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertIn("cputune changed cpu ?", self.ok("show").stdout)
 
     def test_state_from_an_earlier_boot_is_ignored(self) -> None:
         self.ok("lock")
@@ -566,6 +586,47 @@ class RunTest(Case):
         self.assertFalse(marker.exists())
         self.assertFalse(self.state.exists())
 
+    def test_lock_that_fails_halfway_says_how_to_undo(self) -> None:
+        governor = self.cpu / "cpu8/cpufreq/scaling_governor"
+        governor.unlink()
+        governor.mkdir()  # lock fails after boost is off
+        result = self.fails("lock")
+        self.assertIn("scaling_governor", result.stderr)
+        self.assertIn("Settings are partly changed. Undo with: cputune reset", result.stderr)
+
+    def test_interrupt_during_the_lock_resets(self) -> None:
+        with mock.patch.dict(os.environ, CPUTUNE_ROOT=str(self.root)):
+            m = load_module()
+        for existed in (False, True):
+            with self.subTest(existed=existed):
+                calls = []
+                self.state.unlink(missing_ok=True)
+                if existed:  # an earlier lock: run must not undo it
+                    self.state.write_text(json.dumps({"cpus": {}, "boost": {}}))
+
+                def run_root(argv, capture=False, calls=calls):
+                    calls.append(argv[0])
+                    if argv[0] == "lock":  # lock saved its state, then Ctrl+C
+                        self.state.write_text(json.dumps({"cpus": {}, "boost": {}}))
+                        raise KeyboardInterrupt
+                    return subprocess.CompletedProcess(argv, 0, "{}")
+
+                args = types.SimpleNamespace(command=["true"], cpu=None, freq=None, strict=False, json=False)
+                with mock.patch.multiple(m, run_root=run_root, run_checks=lambda *a: []), \
+                        mock.patch("signal.signal"), self.assertRaises(KeyboardInterrupt):
+                    m.cmd_run(args)
+                self.assertEqual(calls, ["lock"] if existed else ["lock", "reset"])
+
+    def test_cannot_measure(self) -> None:
+        for cpu in (8, 9):
+            (self.cpu / f"cpu{cpu}/cpufreq/scaling_cur_freq").unlink()
+        data = self.run_json("--", "true")
+        self.assertEqual(data["warnings"], ["cpu8: cannot measure the frequency under load"])  # from lock
+        self.assertFalse(data["stable"])
+        error = self.fails("run", "--strict", "--", "true").stderr
+        self.assertIn("the lock is not verified: cpu 8,9: cannot measure the frequency under load.", error)
+        self.assertNotIn("faster", error)
+
     def test_lock_that_fails_halfway_is_reset(self) -> None:
         governor = self.cpu / "cpu8/cpufreq/scaling_governor"
         governor.unlink()
@@ -611,6 +672,7 @@ class RunTest(Case):
         warnings = "\n".join(data["warnings"])
         self.assertIn("cpu 8,9 was too hot and ran slower 3 times", warnings)
         self.assertIn("but at 2200 MHz after the lock (too hot, or at its power limit)", warnings)
+        self.assertIn(". Check with: cputune\n", warnings + "\n")  # not the hidden "cputune check"
         self.assertIn(f"another program changed the lock while the command ran: {self.cpu}/intel_pstate/no_turbo",
                       warnings)
         self.assertFalse(self.state.exists())  # reset
@@ -925,6 +987,13 @@ class SudoersTest(Case):
                 shutil.rmtree(self.root / "etc", ignore_errors=True)
                 shutil.rmtree(self.root / "usr", ignore_errors=True)
                 self.check_install(*args)
+
+    def test_install_no_password_no_check_stays_offline(self) -> None:
+        offline = (self.root / "missing").as_uri()
+        result = self.run_tool("install", "--no-password", "--no-check", "--json", CPUTUNE_SOURCE_URL=offline)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("cannot download", result.stderr)  # --no-check: GitHub is not asked
+        self.assertEqual((self.root / "usr/local/bin/cputune").read_bytes(), SCRIPT.read_bytes())
 
     def check_install(self, *args: str) -> None:
         offline = (self.root / "missing").as_uri()  # GitHub is not used in tests
