@@ -12,17 +12,16 @@ their frequency, so that benchmarks give stable results. It is one Python file
 curl -fsSL https://github.com/martinus/cputune/releases/latest/download/cputune | python3 - install
 ```
 
-This installs the latest release in `~/.local/bin`. `cputune update` installs a
-newer release. Only one copy stays installed: if `/usr/local/bin/cputune` exists,
+This installs the latest release in `~/.local/bin`. Run `cputune install` again
+to update. Only one copy stays installed: if `/usr/local/bin/cputune` exists,
 `install` updates that one, and `install --system` deletes the copy in
 `~/.local/bin`.
 
 ## Use
 
 ```sh
-cputune                       # show the cores, best rank first
-cputune watch                 # live view of the core frequencies
-cputune check                 # find what makes benchmark results vary
+cputune                       # the cores, the settings, what can make results vary
+cputune -w                    # live view of the core frequencies
 cputune run -- ./bench        # lock the best core, run ./bench on it, then reset
 cputune run -c 2 -- ./bench   # the same on CPU 2, as taskset -c 2: same CPU every time
 cputune lock                  # lock the best core (without CPU 0) at base frequency
@@ -42,14 +41,14 @@ best-ranked core. With `-c`, the command runs on exactly these CPUs, so results
 stay comparable between runs. `lock` and `run` always lock the whole core: SMT
 siblings share one frequency.
 
-`run` also checks the machine (as `check` does) and measures the frequency
-while the command runs. It warns when something can make the result vary: other
+`run` also checks the load on the machine, and measures the frequency while
+the command runs. It warns when something can make the result vary: other
 load, battery power, a hot CPU that runs slower, or settings that another
 program (such as `tuned`) changed. With `--strict`, the command does not run
 when the lock does not hold, for example when the core runs faster than the lock.
 
-`cputune --help` and `cputune <command> --help` show all options. All commands
-accept `--json`.
+`cputune --help` shows the commands, grouped by task. `cputune <command> --help`
+shows all options. All commands accept `--json`.
 
 ## Use without a password prompt
 
@@ -58,15 +57,14 @@ Scripts and AI agents have no terminal to type a password. To allow `cputune`
 without a password, run this once:
 
 ```sh
-cputune sudoers --install
+cputune install --no-password
 ```
 
 It installs `cputune` in `/usr/local/bin`, owned by root, and adds a sudo rule
 for that copy. Root always runs this copy, also when you start another one, for
-example in `~/.local/bin`. `cputune update` updates both. `cputune sudoers`
-shows the status. Under sudo, `cputune` only runs `lock`, `limit`, `reset` and
-`update`, so the rule gives no more than the CPU settings. Undo:
-`sudo rm /etc/sudoers.d/cputune`.
+example in `~/.local/bin`. `cputune install` updates it. Under sudo, `cputune`
+only runs `lock`, `limit`, `reset` and `update`, so the rule gives no more than
+the CPU settings. Undo: `sudo rm /etc/sudoers.d/cputune`.
 
 ## Use from AI agents
 
@@ -79,7 +77,7 @@ same CPU: `cputune run -c 2 -- <command>`. stdout and the exit code are the
 ones of the command. When cputune prints a warning, the result may vary: tell
 the user. With `--json`, cputune writes JSON to stderr, with `"stable": false`
 and the `warnings`. If `cputune` says that sudo needs a password, stop and ask
-the user to run `cputune sudoers --install`.
+the user to run `cputune install --no-password`.
 ```
 
 ## Development

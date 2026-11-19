@@ -54,13 +54,16 @@ shellcheck examples/*.sh
   measurement is right: the firmware runs below the request and not below about 2170 MHz.
   `amd_pstate_lowest_nonlinear_freq` is 3012 MHz. `tuned` and `tuned-ppd` run (profile balanced).
 - sudo needs a password, so agents cannot run `lock`, `limit`, `reset`, `run` or
-  `sudoers --install` for real: give Martin the command to run.
+  `install --no-password` for real: give Martin the command to run.
 - Fedora sudo: `env_reset`, `always_set_home`.
 - GitHub: no MCP tools; use `gh` (logged in). Right after a push, `gh pr checks` reports no checks:
   use `gh run list --branch <b>` and `gh run watch <id> --exit-status`.
 
 ## Rules
 
+- Few commands: show (`cputune`, `-w` live), run, lock, limit, reset, install. `cputune --help`
+  groups them by task (`HELP`); argparse lists none. `watch`, `check`, `update` and `sudoers` are
+  hidden aliases (no `help=`): scripts keep working, and root needs `update` for its own copy.
 - Security: a sudo rule lets every program of the user run `cputune` as root. Under sudo only
   `lock`, `limit`, `reset` and `update` run (`SUDO_COMMANDS`), the test hooks are off, and no root
   code may run a program or write a file that the user chooses. When a root-owned
@@ -68,7 +71,7 @@ shellcheck examples/*.sh
   root must not run a copy the user can change. Keep it so; test it in `SecurityTest`, `RootCopyTest`.
 - A reboot undoes everything: cputune changes settings only where a reboot resets them (`/sys`,
   and its state in `/run`). Never write a setting that stays, for example `systemctl set-property`
-  without `--runtime`, or files in `/etc`. Only `install`, `update` and `sudoers --install` write
+  without `--runtime`, or files in `/etc`. Only `install` (and its aliases `update`, `sudoers`) writes
   files that stay, on purpose.
 - Only one installed copy (`install_copy`): with `/usr/local/bin/cputune`, `install` updates it, and
   `install --system` deletes `~/.local/bin/cputune`. Two copies drift apart, and PATH finds the wrong one.
@@ -87,7 +90,7 @@ shellcheck examples/*.sh
 
 ## Open
 
-- `lock`, `limit`, `reset`, `run` and `sudoers --install` are not yet verified on real hardware
+- `lock`, `limit`, `reset`, `run` and `install --no-password` are not yet verified on real hardware
   (needs sudo): Martin runs `tests/hardware_check.py`. Intel, EPYC and Raspberry Pi are covered only
   by fake trees.
 - Version 2.0.0 renamed `cpu-tune` to `cputune`. Copies of 1.x look for `cpu-tune` on GitHub, so

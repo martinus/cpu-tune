@@ -197,10 +197,43 @@ class ShowTest(Case):
             self.fail("watch did not show the new values")
 
     def test_watch(self) -> None:
-        lines = self.ok("watch", "--count", "2", "--json").stdout.splitlines()
-        self.assertEqual(len(lines), 2)
-        self.assertEqual(json.loads(lines[1])["command"], "watch")
-        self.assertIn("Ctrl+C", self.ok("watch", "--count", "1").stdout)
+        for args in (("-w",), ("show", "--watch"), ("--interval", "0.1", "-w"), ("watch",)):  # watch: hidden
+            with self.subTest(args=args):
+                lines = self.ok(*args, "--count", "2", "--json").stdout.splitlines()
+                self.assertEqual(len(lines), 2)
+                self.assertEqual(json.loads(lines[1])["command"], "watch")
+        self.assertIn("Ctrl+C", self.ok("-w", "--count", "1").stdout)
+
+    def test_notes_of_the_machine(self) -> None:
+        fake_sysfs.w(self.root / "proc/11/comm", "tuned")
+        fake_sysfs.w(self.root / "proc/12/comm", "tuned-ppd")
+        (self.root / "sys/class/power_supply/AC/online").write_text("0\n")
+        text = self.ok("--color", "never").stdout
+        self.assertIn("★ best core: lock and run use it", text)
+        notes = text[text.index("(all values in MHz)"):].splitlines()[2:]
+        self.assertTrue(notes[0].startswith("! The computer runs on battery."), notes)  # problems first
+        self.assertIn("· tuned and tuned-ppd run: power services of the system, not started by cputune.", text)
+        self.assertIn("  To stop them until the next reboot: sudo systemctl stop tuned tuned-ppd", text)
+        self.assertTrue(all(len(line) <= 100 for line in notes), notes)  # wrapped to COLUMNS
+        data = self.json()
+        self.assertEqual({i["name"]: i["level"] for i in data["checks"]},
+                         {"service": "note", "battery": "warn", "aslr": "note"})
+
+    def test_quiet_desktop_has_no_notes(self) -> None:
+        shutil.rmtree(self.root)
+        fake_sysfs.build(self.root, "amd-ryzen9-7950x")
+        (self.root / "proc/sys/kernel/randomize_va_space").write_text("0\n")
+        text = self.ok("--color", "never").stdout
+        self.assertTrue(text.rstrip().endswith("(all values in MHz)"), text[-200:])
+
+    def test_help_groups_the_main_commands(self) -> None:
+        text = self.ok("--help").stdout
+        for group in ("look at the machine:", "run a benchmark:", "change settings by hand:", "install and update:"):
+            self.assertIn(f"\n{group}\n", text)
+        for hidden in ("watch", "check", "update", "sudoers"):  # still work, for scripts
+            self.assertNotIn(f"cputune {hidden}", text)
+        self.assertIn("cputune install --no-password", text)
+        self.assertTrue(self.ok("install", "--help").stdout.startswith("usage: cputune install "))
 
 
 class LockTest(Case):
@@ -612,7 +645,7 @@ class CheckTest(Case):
         self.assertTrue(data["clean"])
         self.assertEqual(self.levels(data), {"service": "ok", "battery": "ok", "aslr": "note"})
         text = self.ok("check").stdout
-        self.assertIn("Checks for cpu 8,9 (the core that lock and run use)", text)
+        self.assertIn("What can make results vary on cpu 8,9 (the core that lock and run use):", text)
         self.assertIn("Turn it off for one command: setarch -R COMMAND", text)
         self.assertIn("Nothing found that makes results vary.", text)
 
@@ -630,9 +663,10 @@ class CheckTest(Case):
         self.assertEqual(warnings, ["cputune reset", "Connect the power supply."])
         notes = {i["name"]: i for i in data["checks"] if i["level"] == "note"}
         self.assertEqual(list(notes), ["service", "aslr", "cpu 0"])
-        self.assertIn("power-profiles-daemon, tuned can change boost", notes["service"]["text"])
+        self.assertIn("power-profiles-daemon and tuned run: power services of the system, not started by "
+                      "cputune.", notes["service"]["text"])
         self.assertEqual(notes["service"]["fix"],
-                         "Stop until the next reboot: sudo systemctl stop power-profiles-daemon tuned")
+                         "To stop them until the next reboot: sudo systemctl stop power-profiles-daemon tuned")
         self.assertIn("2 problems can make results vary.", self.ok("check", "--cpu", "0").stdout)
 
     def test_desktop_without_aslr(self) -> None:
@@ -859,17 +893,25 @@ class SudoersTest(Case):
         self.assertFalse(data["installed"])
         self.assertIsNone(data["works"])  # sudo is not run in tests
         self.assertTrue(data["rule"].endswith(f"ALL=(root) NOPASSWD: {system_copy}"))
-        self.assertTrue(data["setup"].endswith("sudoers --install"))
+        self.assertTrue(data["setup"].endswith("install --no-password"))
         text = self.ok("sudoers").stdout
         self.assertIn("Set it up with one command:", text)
         self.assertIn(f"install the newest cputune to {system_copy}, owned by root", text)
         self.assertIn("Undo: sudo rm /etc/sudoers.d/cputune", text)
 
     def test_install(self) -> None:
+        for args in (("install", "--no-password"), ("sudoers", "--install")):  # sudoers: hidden, for scripts
+            with self.subTest(args=args):
+                shutil.rmtree(self.root / "etc", ignore_errors=True)
+                shutil.rmtree(self.root / "usr", ignore_errors=True)
+                self.check_install(*args)
+
+    def check_install(self, *args: str) -> None:
         offline = (self.root / "missing").as_uri()  # GitHub is not used in tests
-        result = self.run_tool("sudoers", "--install", "--json", CPUTUNE_SOURCE_URL=offline)
+        result = self.run_tool(*args, "--json", CPUTUNE_SOURCE_URL=offline)
         self.assertEqual(result.returncode, 0, result.stderr)
         data = json.loads(result.stdout)
+        self.assertEqual(data["command"], args[0])
         self.assertEqual(len(data["done"]), 2)
         system_copy = self.root / "usr/local/bin/cputune"
         self.assertEqual(system_copy.read_bytes(), SCRIPT.read_bytes())
@@ -894,14 +936,14 @@ class SudoersTest(Case):
         status = {"user": "ann", "path": "/usr/local/bin/cputune", "installed": True, "works": False,
                   "version": "2.0.0", "outdated": False,
                   "rule": "ann ALL=(root) NOPASSWD: /usr/local/bin/cputune", "file": "/etc/sudoers.d/cputune",
-                  "setup": "cputune sudoers --install", "undo": "sudo rm /etc/sudoers.d/cputune"}
+                  "setup": "cputune install --no-password", "undo": "sudo rm /etc/sudoers.d/cputune"}
         text = "\n".join(m.render_sudoers(status))
-        self.assertIn("cputune sudoers --install", text)
+        self.assertIn("cputune install --no-password", text)
         self.assertNotIn("install the newest", text)  # the copy is there already
         self.assertIn("ann ALL=(root) NOPASSWD: /usr/local/bin/cputune", text)
         text = "\n".join(m.render_sudoers(status | {"works": True}))
         self.assertIn("Everything is set up.", text)
-        self.assertNotIn("sudoers --install", text)
+        self.assertNotIn("install --no-password", text)
         # The rule works, but the copy is older than the one the user runs: root would run old code.
         text = "\n".join(m.render_sudoers(status | {"works": True, "outdated": True}))
         self.assertIn("/usr/local/bin/cputune is version 2.0.0: older than this copy", text)
@@ -1032,7 +1074,7 @@ class SecurityTest(Case):
             cmd.__name__ = f"cmd_{name}"
             return cmd
 
-        names = ("show", "watch", "lock", "run", "limit", "reset", "sudoers", "install", "update")
+        names = ("show", "watch", "check", "lock", "run", "limit", "reset", "sudoers", "install", "update")
         with mock.patch.multiple(m, **{f"cmd_{n}": stub(n) for n in names}):
             for argv in (["run", "--", "sh"], ["install"], ["install", "--system"], ["sudoers", "--install"],
                          ["show"], ["watch"]):

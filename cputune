@@ -23,13 +23,14 @@ import signal
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
-__version__ = "2.3.1"  # increase it for every change: "cputune update" compares versions
+__version__ = "2.4.0"  # increase it for every change: "cputune update" compares versions
 
 # The latest release, not main: raw.githubusercontent.com caches main for 5 minutes, and a
 # release exists only after the tests passed on main.
@@ -56,24 +57,31 @@ SYSTEM_BIN = ROOT / "usr/local/bin"
 COMMANDS = ("show", "watch", "check", "lock", "run", "limit", "reset", "sudoers", "install", "update")
 
 HELP = """\
-Shows the CPU cores ranked by speed, and locks or limits CPU frequencies, so
-that benchmarks give stable results.
+Shows the CPU cores ranked by speed, and locks their frequency, so that
+benchmarks give stable results.
 
-examples:
-  cputune                       show the cores, best rank first
-  cputune show --now            also measure the current frequency (1 s)
-  cputune watch                 live view of the core frequencies
-  cputune check                 find what makes benchmark results vary
-  cputune lock                  lock the best core (without CPU 0) at base frequency
-  cputune lock 3GHz --cpu 2     lock CPU 2 and its SMT sibling at 3000 MHz
-  cputune run -- ./bench        lock, run ./bench on the locked core, then reset
+look at the machine:
+  cputune                       the cores (best first), the settings, and what
+                                can make benchmark results vary
+  cputune -w                    live view of the core frequencies
+  cputune --now                 also measure the current frequency (1 s)
+
+run a benchmark:
+  cputune run -- ./bench        lock the best core, run ./bench on it, reset
   cputune run -c 2 -- ./bench   the same on CPU 2 (as taskset -c 2), every time
-  cputune run --strict -- cmd   run cmd only when the lock is verified
+  cputune run --strict -- ./b   run ./b only when the lock holds
+
+change settings by hand:
+  cputune lock                  lock the best core at base frequency, boost off
+  cputune lock 3GHz -c 2        lock CPU 2 and its SMT sibling at 3000 MHz
   cputune limit --max 2400      all cores: at most 2400 MHz
-  cputune reset                 undo all changes of lock and limit
-  cputune sudoers               show how to run cputune without a password prompt
-  cputune install [--system]    install to ~/.local/bin (or /usr/local/bin)
-  cputune update                update this copy to the newest version on GitHub
+  cputune reset                 undo lock and limit (a reboot also does)
+
+install and update:
+  cputune install               install the newest release, or update to it
+  cputune install --system      the same, in /usr/local/bin, owned by root
+  cputune install --no-password lock, run, limit and reset without a password:
+                                for scripts and AI agents (adds a sudo rule)
 
 FREQ is a number in MHz (2400), a value with a unit (2400MHz, 2.4GHz), or one
 of the words base, min, max. CPUS is a list such as 3, 2,3, 0-7 or all. lock,
@@ -82,15 +90,14 @@ lock min is amd_pstate_lowest_nonlinear_freq: the CPU does not go lower.
 
 run executes COMMAND as your user, pinned to CPUS (as taskset -c CPUS; without
 --cpu: all CPUs of the locked core), and always resets at the end. Its own
-messages go to stderr; stdout and the exit code are the ones of COMMAND.
-run also does the checks of "cputune check", and it measures the frequency
-while COMMAND runs. It warns when the result can vary; then its JSON has
-"stable": false.
+messages go to stderr; stdout and the exit code are the ones of COMMAND. run
+measures the frequency while COMMAND runs, and warns when the result can vary;
+then its JSON has "stable": false.
 
 lock, run, limit and reset need root. They run sudo themselves: do not start
 cputune with sudo. Without a terminal (for example in scripts and AI agents)
-they use "sudo -n" and never ask for a password; "cputune sudoers --install"
-sets that up. Add --json to any command for machine-readable output.
+they use "sudo -n" and never ask for a password. Add --json to any command for
+machine-readable output. "cputune COMMAND --help" shows all options of a command.
 """
 
 
@@ -677,7 +684,7 @@ def render_show(cores: list[Core], info: dict, measured: bool) -> list[str]:
             legend.append("◆ locked")
         if measured:
             legend.append("█ now")
-        legend.append("★ default core for lock")
+        legend.append("★ best core: lock and run use it")
         lines.append("")
         lines.append(paint("   ".join(legend) + "   (all values in MHz)", GRAY))
 
@@ -710,16 +717,24 @@ def show_json(cores: list[Core], info: dict, command: str) -> dict:
 
 
 def cmd_show(args: argparse.Namespace) -> None:
+    if args.watch:
+        cmd_watch(args)
+        return
     cores = get_cores()
     if args.now:
         now = measure([cpu for c in cores if c.has_freq for cpu in c.cpus])
         for core in cores:
             core.now = max((now.get(cpu, 0) for cpu in core.cpus), default=0) or None
     info = system_info()
+    checks = run_checks(None)  # the machine only: at once, no load measurement
     if args.json:
-        print_json(show_json(cores, info, "show"))
-    else:
-        say("\n".join(render_show(cores, info, args.now)))
+        print_json(show_json(cores, info, "show") | {"checks": checks})
+        return
+    lines = render_show(cores, info, args.now)
+    # "changed" is in render_show already. The other notes: what can make results vary.
+    if notes := [item for item in checks if item["level"] != "ok" and item["name"] != "changed"]:
+        lines += ["", *render_checks(notes)]
+    say("\n".join(lines))
 
 
 class FdReader:
@@ -896,21 +911,9 @@ def running_services() -> list[str]:
     return sorted(found)
 
 
-def run_checks(cpus: list[int], seconds: float = 0.5) -> list[dict]:
-    """Things that make benchmark results vary. Reads only, needs no root.
-
-    Each item: name, level ("ok", "note" or "warn"), text, and fix (None when ok).
-    """
-    items: list[dict] = []
-
-    def add(level: str, name: str, text: str, fix: str | None = None) -> None:
-        items.append({"name": name, "level": level, "text": text, "fix": fix})
-
+def load_checks(cpus: list[int], seconds: float, add) -> None:
+    """Other load on the benchmark core and on the machine."""
     cpu_text = format_cpu_list(cpus)
-    if (changed := state_cpus()) is not None:
-        add("warn", "changed", f"cputune already changed cpu {format_cpu_list(changed) or '?'}. "
-            "cputune run does not start then.", "cputune reset")
-
     try:  # do not measure the load that this check puts on the CPUs
         if others := set(os.sched_getaffinity(0)) - set(cpus):
             os.sched_setaffinity(0, others)
@@ -929,10 +932,33 @@ def run_checks(cpus: list[int], seconds: float = 0.5) -> list[dict]:
             add("warn", "machine load", f"The machine is {machine:.0%} busy. Programs on other cores share "
                 "caches, memory and the power limit with the benchmark.", "Stop other programs.")
 
+
+def run_checks(cpus: list[int] | None, seconds: float = 0.5) -> list[dict]:
+    """Things that make benchmark results vary. Reads only, needs no root.
+
+    With cpus: also the load on these CPUs (measured for some seconds), and CPU 0.
+    Without: only the machine, at once. Each item: name, level ("ok", "note" or "warn"),
+    text, and fix (None when ok).
+    """
+    items: list[dict] = []
+
+    def add(level: str, name: str, text: str, fix: str | None = None) -> None:
+        items.append({"name": name, "level": level, "text": text, "fix": fix})
+
+    if (changed := state_cpus()) is not None:
+        add("warn", "changed", f"cputune already changed cpu {format_cpu_list(changed) or '?'}. "
+            "cputune run does not start then.", "cputune reset")
+
+    if cpus:
+        load_checks(cpus, seconds, add)
+
     if services := running_services():
-        names = " ".join(services)
-        add("note", "service", f"{', '.join(services)} can change boost, EPP or the governor. cputune run "
-            "warns when this happens while a command runs.", f"Stop until the next reboot: sudo systemctl stop {names}")
+        names = " and ".join([", ".join(services[:-1]), services[-1]] if len(services) > 1 else services)
+        one = len(services) == 1
+        add("note", "service", f"{names} {'runs' if one else 'run'}: power service{'' if one else 's'} of the "
+            f"system, not started by cputune. {'It' if one else 'They'} can change CPU settings. cputune run "
+            "warns when this changes a lock.",
+            f"To stop {'it' if one else 'them'} until the next reboot: sudo systemctl stop {' '.join(services)}")
     else:
         add("ok", "service", "No power service runs (power-profiles-daemon, tuned, auto-cpufreq).")
 
@@ -954,13 +980,27 @@ def run_checks(cpus: list[int], seconds: float = 0.5) -> list[dict]:
         else:
             add("ok", "aslr", "ASLR is off.")
 
-    if 0 in cpus:
+    if cpus and 0 in cpus:
         add("note", "cpu 0", "CPU 0 often handles more interrupts than the other CPUs.",
             "Choose another core with --cpu.")
     return items
 
 
+def render_checks(items: list[dict], indent: str = "") -> list[str]:
+    """The items, problems first, wrapped to the terminal width."""
+    marks = {"ok": paint("✓", BOLD, GREEN), "note": paint("·", BOLD, BLUE), "warn": paint("!", BOLD, YELLOW)}
+    width = max(40, shutil.get_terminal_size((100, 24)).columns) - len(indent) - 2
+    lines = []
+    for item in sorted(items, key=lambda i: ("warn", "note", "ok").index(i["level"])):
+        for n, line in enumerate(textwrap.wrap(item["text"], width)):
+            lines.append(f"{indent}{marks[item['level']] if n == 0 else ' '} {line}")
+        for line in textwrap.wrap(item["fix"] or "", width):
+            lines.append(paint(f"{indent}  {line}", GRAY))
+    return lines
+
+
 def cmd_check(args: argparse.Namespace) -> None:
+    """Hidden since 2.4.0: cputune shows these notes, and run checks the load. Kept for scripts."""
     cpus = select_cpus(args.cpu, [] if args.cpu else list(default_lock_core(get_cores()).cpus))
     items = run_checks(cpus)
     warnings = sum(item["level"] == "warn" for item in items)
@@ -968,12 +1008,8 @@ def cmd_check(args: argparse.Namespace) -> None:
         print_json({"ok": True, "command": "check", "cpus": cpus, "clean": not warnings, "checks": items})
         return
     which = "" if args.cpu else paint(" (the core that lock and run use)", GRAY)
-    say(f"Checks for cpu {paint(format_cpu_list(cpus), BOLD, WHITE)}{which}")
-    marks = {"ok": paint("✓", BOLD, GREEN), "note": paint("·", BOLD, BLUE), "warn": paint("!", BOLD, YELLOW)}
-    for item in items:
-        say(f"  {marks[item['level']]} {item['text']}")
-        if item["fix"]:
-            say(paint(f"    {item['fix']}", GRAY))
+    say(f"What can make results vary on cpu {paint(format_cpu_list(cpus), BOLD, WHITE)}{which}:")
+    say("\n".join(render_checks(items, "  ")))
     say()
     if warnings:
         say(paint(f"{warnings} problem{'s' if warnings > 1 else ''} can make results vary.", BOLD, YELLOW))
@@ -1004,7 +1040,7 @@ def root_copy() -> str:
         mine, theirs = file_version(Path(script)), file_version(system)
         if version_key(theirs) < version_key(mine):
             warn(f"root runs {system} {theirs}, which is older than this copy ({mine}). "
-                 f"Update it with: {self_command()} update")
+                 f"Update it with: {self_command()} install")
         return str(system)
     return script
 
@@ -1044,7 +1080,7 @@ def run_root(argv: list[str], capture: bool = False) -> subprocess.CompletedProc
             die(
                 f"needs root, but sudo cannot run without a password here "
                 f"({result.stderr.strip()}). Run cputune in a terminal, or allow it "
-                "without a password: see 'cputune sudoers'"
+                "without a password: cputune install --no-password"
             )
         sys.stderr.write(result.stderr)
     return result
@@ -1619,7 +1655,7 @@ def sudoers_status() -> dict:
         "works": sudo_works(target) if installed else None,
         "rule": f"{user} ALL=(root) NOPASSWD: {target}",
         "file": SUDOERS_FILE,
-        "setup": f"{self_command()} sudoers --install",
+        "setup": f"{self_command()} install --no-password",
         "undo": f"sudo rm {SUDOERS_FILE}",
     }
 
@@ -1707,7 +1743,8 @@ def cmd_sudoers(args: argparse.Namespace) -> None:
                  "Check the other rules in /etc/sudoers and /etc/sudoers.d.")
         status["done"] = done
     if args.json:
-        print_json({"ok": True, "command": "sudoers", **status})
+        print_json({"ok": True, "command": "install" if getattr(args, "no_password", False) else "sudoers",
+                    **status})
         return
     for line in status.get("done", []):
         say(paint("✓ ", BOLD, GREEN) + line)
@@ -1894,6 +1931,11 @@ def legacy_note() -> None:
 
 
 def cmd_install(args: argparse.Namespace) -> None:
+    """Installs the newest release, or updates to it. Replaces "update" and "sudoers --install"."""
+    if args.no_password:
+        args.install, args.rule = True, False
+        cmd_sudoers(args)
+        return
     target, version, origin, notes = install_copy(args.system, args.no_check)
     path_note(target)  # before the output, so that --json has the warnings
     legacy_note()
@@ -1965,25 +2007,27 @@ def build_parser() -> argparse.ArgumentParser:
                         help="use colors (default: auto)")
 
     parser = argparse.ArgumentParser(
-        prog="cputune", description=HELP, parents=[common],
+        prog="cputune", usage="cputune [COMMAND] [OPTIONS]", description=HELP, parents=[common],
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"cputune {__version__}")
-    sub = parser.add_subparsers(title="commands", metavar="COMMAND")
+    sub = parser.add_subparsers(prog="cputune", help=argparse.SUPPRESS)  # HELP groups the commands by task
     cpu_help = "CPUs to use; their SMT siblings are locked too (default: the best-ranked core without CPU 0)"
 
-    p = sub.add_parser("show", parents=[common], help="system info and cores, best rank first (default)")
+    watch = argparse.ArgumentParser(add_help=False)
+    watch.add_argument("--interval", type=float, default=1.0, metavar="S", help="seconds per update (default: 1)")
+    watch.add_argument("--count", type=int, default=0, metavar="N", help="stop after N updates")
+
+    p = sub.add_parser("show", parents=[common, watch],
+                       help="cores, settings and what can make results vary (default command)")
+    p.add_argument("-w", "--watch", action="store_true", help="live view of the core frequencies")
     p.add_argument("--now", action="store_true", help="also measure the current frequency (1 s)")
     p.set_defaults(func=cmd_show)
 
-    p = sub.add_parser("watch", parents=[common], help="live view of the core frequencies")
-    p.add_argument("--interval", type=float, default=1.0, metavar="S", help="seconds per update (default: 1)")
-    p.add_argument("--count", type=int, default=0, metavar="N", help="stop after N updates")
+    # Hidden (no help=): "cputune -w" and "cputune" replace them. Kept so that scripts keep working.
+    p = sub.add_parser("watch", parents=[common, watch])
     p.set_defaults(func=cmd_watch)
-
-    p = sub.add_parser("check", parents=[common], help="find what makes benchmark results vary",
-                       description="Checks the load on the core, power services, battery, ASLR and CPU 0. "
-                       "Reads only, needs no root. run does the same checks and warns.")
+    p = sub.add_parser("check", parents=[common])
     p.add_argument("-c", "--cpu", metavar="CPUS", help="CPUs to check (default: the core that run uses)")
     p.set_defaults(func=cmd_check)
 
@@ -2018,9 +2062,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser(
         "install", parents=[common], help="install to ~/.local/bin, or to /usr/local/bin with --system",
-        description="Installs the newer of this file and the latest release on GitHub.",
+        description="Installs the newer of this file and the latest release on GitHub, or updates to it. "
+        "Only one copy stays: when /usr/local/bin/cputune exists, install updates that one.",
     )
     p.add_argument("--system", action="store_true", help="install to /usr/local/bin, owned by root (uses sudo)")
+    p.add_argument("--no-password", action="store_true",
+                   help="also allow lock, run, limit and reset without a password: installs to /usr/local/bin "
+                   "and adds a sudo rule for that copy (uses sudo)")
     p.add_argument("--no-check", action="store_true", help="install this file, do not look on GitHub")
     p.set_defaults(func=cmd_install)
 
@@ -2037,7 +2085,7 @@ def with_default_command(argv: list[str]) -> list[str]:
     for a in argv:
         if expect_value:
             expect_value = False
-        elif a == "--color":
+        elif a in ("--color", "--interval", "--count"):
             expect_value = True
         elif not a.startswith("-"):
             return argv  # an unknown command: argparse reports it
