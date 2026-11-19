@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 MACHINES = Path(__file__).parent / "machines"
+BOOT_ID = "5e0a4c1f-0d6b-4b52-9f39-2f1c8f0e7a11"
+LAPTOPS = ("intel-i9-13950hx", "amd-ryzen-ai7-350")  # these have a power supply in sysfs
 
 # Base frequency in MHz from the vendor data sheets. Intel hybrid: P-cores and E-cores.
 BASE_MHZ = {
@@ -95,6 +97,8 @@ def build(root: Path, name: str) -> Machine:
             w(f / "scaling_available_governors", " ".join(m.governors))
             w(f / "scaling_driver", m.driver)
             if m.driver == "intel_pstate":
+                w(d / "thermal_throttle/core_throttle_count", 0)
+                w(d / "thermal_throttle/package_throttle_count", 0)
                 w(d / "topology/itmt_score", rank)
                 w(f / "base_frequency", base * 1000)
             if m.driver.startswith("amd-pstate") or m.driver == "acpi-cpufreq":
@@ -118,6 +122,15 @@ def build(root: Path, name: str) -> Machine:
     w(root / "proc/cpuinfo", f"processor\t: 0\n{key}\t: {m.model}\n")
     w(root / "proc/sys/kernel/osrelease", m.kernel)
     w(root / "proc/sys/kernel/version", "#1 SMP PREEMPT_DYNAMIC")
+    w(root / "proc/sys/kernel/random/boot_id", BOOT_ID)
+    w(root / "proc/sys/kernel/randomize_va_space", 2)
+    # All CPUs idle. The file does not change, so cputune measures no load.
+    w(root / "proc/stat", "cpu  0 0 0 0 0 0 0 0 0 0\n"
+      + "".join(f"cpu{n} 1000 0 500 90000 100 0 20 0 0 0\n" for n in m.cpus))
+    if name in LAPTOPS:
+        w(root / "sys/class/power_supply/AC/type", "Mains")
+        w(root / "sys/class/power_supply/AC/online", 1)
+        w(root / "sys/class/power_supply/BAT0/type", "Battery")
     (root / "run").mkdir(exist_ok=True)
     return m
 

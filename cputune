@@ -23,13 +23,13 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
-__version__ = "2.2.0"  # increase it for every change: "cputune update" compares versions
+__version__ = "2.3.0"  # increase it for every change: "cputune update" compares versions
 
 # The latest release, not main: raw.githubusercontent.com caches main for 5 minutes, and a
 # release exists only after the tests passed on main.
@@ -49,10 +49,11 @@ ROOT = Path(os.environ["CPUTUNE_ROOT"]) if TEST_MODE else Path("/")
 CPU_BASE = ROOT / "sys/devices/system/cpu"
 STATE_FILE = ROOT / "run/cputune.json"
 STATE_SHOWN = "/run/cputune.json"
+BOOT_ID = ROOT / "proc/sys/kernel/random/boot_id"  # new after each boot
 USER_BIN = ROOT / "home/.local/bin" if TEST_MODE else Path.home() / ".local/bin"
 SYSTEM_BIN = ROOT / "usr/local/bin"
 
-COMMANDS = ("show", "watch", "lock", "run", "limit", "reset", "sudoers", "install", "update")
+COMMANDS = ("show", "watch", "check", "lock", "run", "limit", "reset", "sudoers", "install", "update")
 
 HELP = """\
 Shows the CPU cores ranked by speed, and locks or limits CPU frequencies, so
@@ -62,10 +63,12 @@ examples:
   cputune                       show the cores, best rank first
   cputune show --now            also measure the current frequency (1 s)
   cputune watch                 live view of the core frequencies
+  cputune check                 find what makes benchmark results vary
   cputune lock                  lock the best core (without CPU 0) at base frequency
   cputune lock 3GHz --cpu 2     lock CPU 2 and its SMT sibling at 3000 MHz
   cputune run -- ./bench        lock, run ./bench on the locked core, then reset
   cputune run -c 2 -- ./bench   the same on CPU 2 (as taskset -c 2), every time
+  cputune run --strict -- cmd   run cmd only when the lock is verified
   cputune limit --max 2400      all cores: at most 2400 MHz
   cputune reset                 undo all changes of lock and limit
   cputune sudoers               show how to run cputune without a password prompt
@@ -79,6 +82,9 @@ run and limit always include the SMT siblings of each CPU.
 run executes COMMAND as your user, pinned to CPUS (as taskset -c CPUS; without
 --cpu: all CPUs of the locked core), and always resets at the end. Its own
 messages go to stderr; stdout and the exit code are the ones of COMMAND.
+run also does the checks of "cputune check", and it measures the frequency
+while COMMAND runs. It warns when the result can vary; then its JSON has
+"stable": false.
 
 lock, run, limit and reset need root. They run sudo themselves: do not start
 cputune with sudo. Without a terminal (for example in scripts and AI agents)
@@ -417,6 +423,30 @@ def system_info() -> dict:
     return info
 
 
+def state_exists() -> bool:
+    """True when cputune changed settings in this boot.
+
+    A reboot resets all settings, so a state file from an earlier boot is stale. /run is
+    in memory and a reboot clears it, but the boot ID makes sure. Root deletes a stale file.
+    """
+    try:
+        state = json.loads(STATE_FILE.read_text())
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        return True  # load_state reports the problem
+    saved = state.get("boot_id") if isinstance(state, dict) else None
+    now = read_str(BOOT_ID)
+    if saved is None or now is None or saved == now:  # before 2.3.0, files had no boot ID
+        return True
+    if os.geteuid() == 0 or TEST_MODE:
+        try:
+            STATE_FILE.unlink()
+        except OSError:
+            pass
+    return False
+
+
 def load_state() -> dict:
     try:
         state = json.loads(STATE_FILE.read_text())
@@ -431,7 +461,7 @@ def load_state() -> dict:
 
 def state_cpus() -> list[int] | None:
     """The CPUs that cputune changed, or None when nothing is changed."""
-    if not STATE_FILE.exists():
+    if not state_exists():
         return None
     try:
         return sorted(int(c) for c in load_state()["cpus"])
@@ -813,6 +843,143 @@ def cmd_watch(args: argparse.Namespace) -> None:
             OUT.flush()
 
 
+# ------------------------------------------------------------------ check
+
+# Services that change CPU settings on their own: while a benchmark runs, they can turn boost
+# back on, or change EPP or the governor. Key: /proc/PID/comm, at most 15 characters.
+POWER_SERVICES = {
+    "power-profiles-": "power-profiles-daemon",
+    "tuned": "tuned",
+    "tuned-ppd": "tuned-ppd",
+    "auto-cpufreq": "auto-cpufreq",
+    "system76-power": "com.system76.PowerDaemon",
+}
+
+
+def cpu_times() -> dict[int, tuple[int, int]]:
+    """Busy time and total time of each CPU since boot, from /proc/stat (in clock ticks)."""
+    times = {}
+    try:
+        lines = (ROOT / "proc/stat").read_text().splitlines()
+    except OSError:
+        return times
+    for line in lines:
+        name, *values = line.split() or [""]
+        if name.startswith("cpu") and name[3:].isdigit() and len(values) >= 5:
+            try:
+                ticks = [int(v) for v in values[:8]]  # user nice system idle iowait irq softirq steal
+            except ValueError:
+                continue
+            total = sum(ticks)
+            times[int(name[3:])] = (total - ticks[3] - ticks[4], total)
+    return times
+
+
+def busy_fractions(seconds: float) -> dict[int, float]:
+    """How busy each CPU is (0.0 to 1.0), measured over some seconds."""
+    before = cpu_times()
+    time.sleep(0 if TEST_MODE else seconds)
+    after = cpu_times()
+    busy = {}
+    for cpu in before.keys() & after.keys():
+        if total := after[cpu][1] - before[cpu][1]:
+            busy[cpu] = max(0.0, min(1.0, (after[cpu][0] - before[cpu][0]) / total))
+    return busy
+
+
+def running_services() -> list[str]:
+    found = set()
+    for path in (ROOT / "proc").glob("[0-9]*/comm"):
+        if (service := POWER_SERVICES.get(read_str(path) or "")) is not None:
+            found.add(service)
+    return sorted(found)
+
+
+def run_checks(cpus: list[int], seconds: float = 0.5) -> list[dict]:
+    """Things that make benchmark results vary. Reads only, needs no root.
+
+    Each item: name, level ("ok", "note" or "warn"), text, and fix (None when ok).
+    """
+    items: list[dict] = []
+
+    def add(level: str, name: str, text: str, fix: str | None = None) -> None:
+        items.append({"name": name, "level": level, "text": text, "fix": fix})
+
+    cpu_text = format_cpu_list(cpus)
+    if (changed := state_cpus()) is not None:
+        add("warn", "changed", f"cputune already changed cpu {format_cpu_list(changed) or '?'}. "
+            "cputune run does not start then.", "cputune reset")
+
+    try:  # do not measure the load that this check puts on the CPUs
+        if others := set(os.sched_getaffinity(0)) - set(cpus):
+            os.sched_setaffinity(0, others)
+    except OSError:
+        pass
+    busy = busy_fractions(seconds)
+    if busy:
+        loaded = [cpu for cpu in cpus if busy.get(cpu, 0) >= 0.1]
+        if loaded:
+            used = ", ".join(f"cpu {cpu} {busy[cpu]:.0%}" for cpu in loaded)
+            add("warn", "load", f"Other programs use the benchmark core: {used} busy. They slow it down.",
+                "Stop these programs, or choose another core with --cpu.")
+        else:
+            add("ok", "load", f"No other load on cpu {cpu_text}.")
+        if (machine := sum(busy.values()) / len(busy)) >= 0.25:
+            add("warn", "machine load", f"The machine is {machine:.0%} busy. Programs on other cores share "
+                "caches, memory and the power limit with the benchmark.", "Stop other programs.")
+
+    services = running_services()
+    for service in services:
+        add("warn", "service", f"{service} runs. It can change boost, EPP or the governor while a benchmark "
+            "runs.", f"Stop it until the next reboot: sudo systemctl stop {service}")
+    if not services:
+        add("ok", "service", "No power service runs (power-profiles-daemon, tuned, auto-cpufreq).")
+
+    online = []
+    for supply in (ROOT / "sys/class/power_supply").glob("*"):
+        if read_str(supply / "type") in ("Mains", "USB") and (value := read_int(supply / "online")) is not None:
+            online.append(value)
+    if online and not any(online):
+        add("warn", "battery", "The computer runs on battery. Then the CPU often has lower power limits.",
+            "Connect the power supply.")
+    elif online:
+        add("ok", "battery", "The power supply is connected.")
+
+    if (aslr := read_int(ROOT / "proc/sys/kernel/randomize_va_space")) is not None:
+        if aslr:
+            add("note", "aslr", "ASLR is on: memory addresses change with each run. This can change the "
+                "result a little.",
+                "Turn it off for one command: setarch -R COMMAND")
+        else:
+            add("ok", "aslr", "ASLR is off.")
+
+    if 0 in cpus:
+        add("note", "cpu 0", "CPU 0 often handles more interrupts than the other CPUs.",
+            "Choose another core with --cpu.")
+    return items
+
+
+def cmd_check(args: argparse.Namespace) -> None:
+    cpus = select_cpus(args.cpu, [] if args.cpu else list(default_lock_core(get_cores()).cpus))
+    items = run_checks(cpus)
+    warnings = sum(item["level"] == "warn" for item in items)
+    if args.json:
+        print_json({"ok": True, "command": "check", "cpus": cpus, "clean": not warnings, "checks": items})
+        return
+    which = "" if args.cpu else paint(" (the core that lock and run use)", GRAY)
+    say(f"Checks for cpu {paint(format_cpu_list(cpus), BOLD, WHITE)}{which}")
+    marks = {"ok": paint("✓", BOLD, GREEN), "note": paint("·", BOLD, BLUE), "warn": paint("!", BOLD, YELLOW)}
+    for item in items:
+        say(f"  {marks[item['level']]} {item['text']}")
+        if item["fix"]:
+            say(paint(f"    {item['fix']}", GRAY))
+    say()
+    if warnings:
+        say(paint(f"{warnings} problem{'s' if warnings > 1 else ''} can make results vary.", BOLD, YELLOW))
+    else:
+        say(paint("✓ ", BOLD, GREEN) + "Nothing found that makes results vary.")
+
+
 # ------------------------------------------------------------------ root
 
 
@@ -919,11 +1086,11 @@ def save_state(cpus: list[int], exclusive: bool) -> None:
     a later write fails. With exclusive=True, fail when cputune already changed
     something: then two benchmarks cannot use cputune at the same time.
     """
-    existed = STATE_FILE.exists()
+    existed = state_exists()
     if existed and exclusive:
         cpus_text = format_cpu_list(state_cpus() or [])
         die(f"cputune already changed cpu {cpus_text}. Undo it first with: cputune reset")
-    state = load_state() if existed else {"version": 1, "cpus": {}, "boost": {}}
+    state = load_state() if existed else {"version": 1, "boot_id": read_str(BOOT_ID), "cpus": {}, "boost": {}}
 
     for cpu in cpus:
         if str(cpu) not in state["cpus"]:
@@ -1127,7 +1294,7 @@ def cmd_limit(args: argparse.Namespace) -> None:
 def cmd_reset(args: argparse.Namespace) -> None:
     ensure_root(args)
     errors: list[str] = []
-    if not STATE_FILE.exists():
+    if not state_exists():
         # Nothing saved, for example after a change by another tool: open the full range.
         cpus = freq_cpus()
         for cpu in cpus:
@@ -1174,30 +1341,106 @@ def cmd_reset(args: argparse.Namespace) -> None:
         say(paint("✓ ", BOLD, GREEN) + f"Restored cpu {cpus}: boost, governor and frequency range.")
 
 
+def throttle_count(cpu: int) -> int | None:
+    """How often the core of this CPU and its package were too hot and ran slower, since boot.
+    None: the kernel does not count it (only Intel CPUs have these counters)."""
+    counts = [read_int(CPU_BASE / f"cpu{cpu}/thermal_throttle/{name}")
+              for name in ("core_throttle_count", "package_throttle_count")]
+    known = [n for n in counts if n is not None]
+    return sum(known) if known else None
+
+
+def lock_settings(cpus: list[int]) -> dict[str, str | None]:
+    """The files that a lock sets, with their values: run checks that no other program changes them."""
+    paths = {fdir(cpu) / name for cpu in cpus for name in
+             ("scaling_min_freq", "scaling_max_freq", "scaling_governor", "energy_performance_preference")}
+    paths |= {switch[0] for cpu in cpus if (switch := boost_switch(cpu))}
+    return {str(path): read_str(path) for path in sorted(paths) if path.exists()}
+
+
+def sample_frequencies(cpus: list[int], stop: threading.Event, samples: dict[int, list[int]]) -> None:
+    """Reads the frequency of the CPUs every 0.5 s until stop is set, and once more after that.
+
+    cpuinfo_avg_freq (new kernels) is the average that the hardware counted; it has no
+    value while a CPU sleeps. This runs in a thread of cputune, not on the benchmark CPUs.
+    """
+    reader = FdReader()
+    files = {}
+    for cpu in cpus:
+        avg = fdir(cpu) / "cpuinfo_avg_freq"
+        files[cpu] = avg if avg.exists() else fdir(cpu) / "scaling_cur_freq"
+    try:
+        while True:
+            stopped = stop.wait(0.5)
+            for cpu, path in files.items():
+                if khz := reader.int(path):
+                    samples[cpu].append(khz // 1000)
+            if stopped:
+                return
+    finally:
+        reader.close()
+
+
 def cmd_run(args: argparse.Namespace) -> None:
     if not args.command:
         die("give the command after --. Example: cputune run -- ./bench")
+    problems: list[str] = []  # everything that can make the result vary
+
+    def problem(text: str) -> None:
+        problems.append(text)
+        warn(text)
+
+    # 1. Checks, as the user and before any change. lock reports a bad --cpu.
+    try:
+        check_cpus = select_cpus(args.cpu, [] if args.cpu else list(default_lock_core(get_cores()).cpus))
+    except Error:
+        check_cpus = []
+    if check_cpus:
+        for item in run_checks(check_cpus, 0.3):
+            if item["level"] == "warn" and item["name"] != "changed":  # lock reports "changed"
+                problem(f"{item['text'][0].lower()}{item['text'][1:]} {item['fix']}")
+
+    # 2. Lock, as root.
     lock = ["lock", "--exclusive", "--json", f"--color={'always' if COLOR else 'never'}"]
     if args.freq is not None:
         lock.append(str(args.freq))
     if args.cpu is not None:
         lock += ["--cpu", args.cpu]
 
-    existed = STATE_FILE.exists()
+    existed = state_exists()
     result = run_root(lock, capture=True)
     try:
         locked = json.loads(result.stdout)
     except ValueError:
         locked = {"ok": False, "error": result.stdout.strip() or "lock failed"}
     if result.returncode != 0 or not locked.get("ok"):
-        if not existed and STATE_FILE.exists():  # the lock changed something before it failed
+        if not existed and state_exists():  # the lock changed something before it failed
             run_root(["reset", "--json", "--color=never"], capture=True)
         die(f"lock failed: {locked.get('error', 'unknown error')}")
 
+    def reset() -> bool:
+        try:
+            done = run_root(["reset", "--json", "--color=never"], capture=True)
+        except Error as e:
+            done = subprocess.CompletedProcess([], 1, str(e))
+        if done.returncode != 0:
+            warn(f"reset failed. Undo by hand with: cputune reset\n{done.stdout.strip()}")
+        return done.returncode == 0
+
     cpus = locked["cpus"]
+    cores = locked["cores"]
     pin = locked.get("pin_cpus", cpus)
-    mhz = ",".join(str(c["target_mhz"]) for c in locked["cores"])
-    measured = ",".join(str(c["measured_mhz"]) for c in locked["cores"])
+    unverified = [c for c in cores if not c["ok"]]
+    for core in unverified:
+        problems.append(f"cpu {format_cpu_list(core['cpus'])}: measured {core['measured_mhz'] or '?'} MHz "
+                        f"under load, but the lock is {core['target_mhz']} MHz")  # lock warned already
+    if args.strict and unverified:
+        reset()
+        die(f"the lock is not verified: {'; '.join(problems[-len(unverified):])}. "
+            "With --strict, the command does not run.")
+
+    mhz = ",".join(str(c["target_mhz"]) for c in cores)
+    measured = ",".join(str(c["measured_mhz"]) for c in cores)
     if not args.json:
         say(
             paint("cputune: ", GRAY)
@@ -1211,37 +1454,83 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGHUP, stop)
+    # 3. Run the command on the pinned CPUs. Meanwhile, cputune samples the frequency from other CPUs.
+    groups = [[cpu for cpu in core["cpus"] if cpu in pin] for core in cores]  # where the command runs
+    throttled_before = [throttle_count(core["cpus"][0]) for core in cores]
+    settings = lock_settings(cpus)
+    samples: dict[int, list[int]] = {cpu: [] for group in groups for cpu in group}
+    stop_sampling = threading.Event()
+    sampler = threading.Thread(target=sample_frequencies, args=(sorted(samples), stop_sampling, samples))
     returncode = 1
     try:
+        allowed: set[int] = set()
         try:
+            allowed = os.sched_getaffinity(0)
             os.sched_setaffinity(0, pin)
         except OSError as e:
             if not TEST_MODE:
                 die(f"cannot pin to cpu {format_cpu_list(pin)}: {e.strerror}")
         env = dict(os.environ, CPUTUNE_CPUS=format_cpu_list(pin))
         try:
-            returncode = subprocess.call(args.command, env=env)
+            proc = subprocess.Popen(args.command, env=env)
         except OSError as e:
             die(f"cannot run {args.command[0]}: {e.strerror}")
-    finally:
+        try:  # cputune itself leaves the locked cores to the command
+            if others := allowed - set(cpus):
+                os.sched_setaffinity(0, others)
+        except OSError:
+            pass
+        sampler.start()
         try:
-            reset = run_root(["reset", "--json", "--color=never"], capture=True)
-        except Error as e:
-            reset = subprocess.CompletedProcess([], 1, str(e))
-        if reset.returncode != 0:
-            warn(f"reset failed. Undo by hand with: cputune reset\n{reset.stdout.strip()}")
-        elif not args.json:
+            returncode = proc.wait()
+        except BaseException:
+            proc.kill()
+            proc.wait()
+            raise
+        finally:
+            stop_sampling.set()
+            sampler.join()
+
+        # 4. Did the frequency stay at the lock?
+        changed = [path for path, value in settings.items() if read_str(Path(path)) != value]
+        if changed:
+            problem("another program changed the lock while the command ran: "
+                    f"{', '.join(changed)}. Check with: cputune check")
+        for core, group, before in zip(cores, groups, throttled_before):
+            values = [mhz for cpu in group for mhz in samples[cpu]]
+            core["run_avg_mhz"] = round(sum(values) / len(values)) if values else None
+            core["run_min_mhz"] = min(values) if values else None
+            after = throttle_count(core["cpus"][0])
+            core["throttled"] = after - before if after is not None and before is not None else None
+            where, want, avg = format_cpu_list(core["cpus"]), core["target_mhz"], core["run_avg_mhz"]
+            if not args.json:
+                text = f"cpu {where} ran at {avg or '?'} MHz (lowest {core['run_min_mhz'] or '?'} MHz)"
+                if core["throttled"] == 0:
+                    text += ", not throttled"
+                say(paint("cputune: ", GRAY) + text)
+            if avg is not None and abs(avg - want) > max(50, want * 0.03):
+                why = "too hot, or at its power limit" if avg < want else "did another program change the lock?"
+                problem(f"cpu {where} ran at {avg} MHz on average while the command ran, but the lock is "
+                        f"{want} MHz ({why})")
+            if core["throttled"]:
+                problem(f"cpu {where} was too hot and ran slower {core['throttled']} times while the command ran")
+    finally:
+        if reset() and not args.json:
             say(paint("cputune: ", GRAY) + f"reset done. The command exited with {returncode}.")
 
+    stable = not problems
+    if not args.json and not stable:
+        say(paint("cputune: ", GRAY) + paint("the result may vary: see the warnings above.", BOLD, YELLOW))
     if args.json:
         print_json({
             "ok": True,
             "command": "run",
             "cpus": cpus,
             "pin_cpus": pin,
-            "cores": locked["cores"],
+            "cores": cores,
             "exit_code": returncode,
-        } | ({"warnings": locked["warnings"] + WARNINGS} if locked.get("warnings") else {}))
+            "stable": stable,
+        } | ({"warnings": locked.get("warnings", []) + WARNINGS} if locked.get("warnings") or WARNINGS else {}))
     sys.exit(returncode)
 
 
@@ -1436,6 +1725,8 @@ def check_source(source: bytes, origin: str) -> None:
 
 def download() -> bytes:
     """The newest cputune from GitHub. Tests can use another URL."""
+    import urllib.request  # here, not at the top: it makes every start 15 ms slower
+
     url = os.environ.get("CPUTUNE_SOURCE_URL", SOURCE_URL) if TEST_MODE else SOURCE_URL
     try:
         with urllib.request.urlopen(url, timeout=30) as response:
@@ -1665,6 +1956,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--count", type=int, default=0, metavar="N", help="stop after N updates")
     p.set_defaults(func=cmd_watch)
 
+    p = sub.add_parser("check", parents=[common], help="find what makes benchmark results vary",
+                       description="Checks the load on the core, power services, battery, ASLR and CPU 0. "
+                       "Reads only, needs no root. run does the same checks and warns.")
+    p.add_argument("-c", "--cpu", metavar="CPUS", help="CPUs to check (default: the core that run uses)")
+    p.set_defaults(func=cmd_check)
+
     p = sub.add_parser("lock", parents=[common], help="lock cores to one frequency, boost off")
     p.add_argument("freq", nargs="?", type=parse_freq, metavar="FREQ", help="frequency (default: base)")
     p.add_argument("-c", "--cpu", metavar="CPUS", help=cpu_help)
@@ -1673,9 +1970,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_lock)
 
     p = sub.add_parser("run", parents=[common], help="lock, run a command on the locked core, reset",
-                       usage="cputune run [FREQ] [--cpu CPUS] -- COMMAND [ARG ...]")
+                       usage="cputune run [FREQ] [--cpu CPUS] [--strict] -- COMMAND [ARG ...]")
     p.add_argument("freq", nargs="?", type=parse_freq, metavar="FREQ", help="frequency (default: base)")
     p.add_argument("-c", "--cpu", metavar="CPUS", help=cpu_help)
+    p.add_argument("--strict", action="store_true",
+                   help="do not run COMMAND when the measured frequency is not the lock")
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("limit", parents=[common], help="set the frequency range of cores")
@@ -1694,7 +1993,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser(
         "install", parents=[common], help="install to ~/.local/bin, or to /usr/local/bin with --system",
-        description="Installs the newer of this file and the version on GitHub main.",
+        description="Installs the newer of this file and the latest release on GitHub.",
     )
     p.add_argument("--system", action="store_true", help="install to /usr/local/bin, owned by root (uses sudo)")
     p.add_argument("--no-check", action="store_true", help="install this file, do not look on GitHub")

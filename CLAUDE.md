@@ -7,10 +7,12 @@ agents that run benchmarks (`cputune run -- <cmd>`, `--json`).
 
 - `cputune`: the whole tool. One file, Python 3.9+, standard library only: keep it so (users copy
   one file; `update` replaces one file). Sections start with `# ----- <name>`: terminal output,
-  read sysfs, measure, render, show/watch, root, change settings, sudoers, install/update, main.
+  read sysfs, measure, render, show/watch, check, root, change settings, sudoers, install/update, main.
 - `tests/test_cputune.py`: unittest. `tests/fake_sysfs.py` builds fake `/sys` trees from
   `tests/machines/*.txt` (recorded output of 6 real machines: Intel hybrid, EPYC acpi-cpufreq,
   3 Ryzen amd-pstate-epp, Raspberry Pi). `tests/check_version.py`: CI version check.
+- `tests/run.py`: runs the tests in parallel (CI uses it). `tests/hardware_check.py`: lock, limit,
+  reset and run on the real machine, with sudo; Martin runs it, CI cannot.
 - `.github/workflows/test.yml`: tests (python:3.9-slim and 3.14-slim containers; setup-python has
   no 3.9 on new runners), `version` (PRs), `release` (main).
 - `docs/show.png`: README screenshot; `docs/ansi2png.py` makes it (usage in its docstring).
@@ -18,7 +20,7 @@ agents that run benchmarks (`cputune run -- <cmd>`, `--json`).
 ## Checks
 
 ```sh
-python3 -m unittest discover -s tests          # ~15 s; also run with python3.9 (installed here)
+python3 tests/run.py                           # ~5 s, parallel; also run with python3.9 (installed here)
 ruff check --select E,F,W,B,UP --target-version py39 --line-length 120 cputune tests docs
 shellcheck examples/*.sh
 ```
@@ -33,6 +35,11 @@ shellcheck examples/*.sh
   `unittest.mock`, see `SecurityTest`. Stub the `cmd_*` functions there: under simulated sudo the
   hooks are off, so a real command would change this machine.
 - Tests must not depend on git: CI containers have no git, so the checkout has no `.git`.
+- Keep tests fast: CI waits for them. Fake trees go to `/dev/shm` (8 times faster than disk). No
+  `sleep` in tests: under `CPUTUNE_ROOT`, cputune does not wait. Tests run in parallel, so a test
+  must not change files outside its own tree.
+- Tests also pass as root (the CI containers run as root). A test that needs a copy not owned by
+  root copies the script into its tree, see `SudoersTest`.
 - Mutation checks: back up the file to the scratchpad, apply one replacement, run one test with a
   timeout (`watch` never ends), restore in `finally`, then `cmp`. Check that the mutation compiles.
   Never `pkill -f` a pattern from your own command line: it kills your own shell.
@@ -54,6 +61,10 @@ shellcheck examples/*.sh
   code may run a program or write a file that the user chooses. When a root-owned
   `/usr/local/bin/cputune` exists, sudo always runs that copy (`root_copy`): the rule names it, and
   root must not run a copy the user can change. Keep it so; test it in `SecurityTest`, `RootCopyTest`.
+- A reboot undoes everything: cputune changes settings only where a reboot resets them (`/sys`,
+  and its state in `/run`). Never write a setting that stays, for example `systemctl set-property`
+  without `--runtime`, or files in `/etc`. Only `install`, `update` and `sudoers --install` write
+  files that stay, on purpose.
 - Only one installed copy (`install_copy`): with `/usr/local/bin/cputune`, `install` updates it, and
   `install --system` deletes `~/.local/bin/cputune`. Two copies drift apart, and PATH finds the wrong one.
 - Every change to `cputune` increases `__version__`: fix = patch, feature = minor, breaking change
@@ -72,6 +83,7 @@ shellcheck examples/*.sh
 ## Open
 
 - `lock`, `limit`, `reset`, `run` and `sudoers --install` are not yet verified on real hardware
-  (needs sudo). Intel, EPYC and Raspberry Pi are covered only by fake trees.
+  (needs sudo): Martin runs `tests/hardware_check.py`. Intel, EPYC and Raspberry Pi are covered only
+  by fake trees.
 - Version 2.0.0 renamed `cpu-tune` to `cputune`. Copies of 1.x look for `cpu-tune` on GitHub, so
   they cannot update; `install` and `sudoers` warn about old copies (`legacy_note`).
