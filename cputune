@@ -26,11 +26,13 @@ import tempfile
 import textwrap
 import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import NoReturn
 
-__version__ = "2.4.1"  # increase it for every change: "cputune update" compares versions
+TYPE_CHECKING = False
+if TYPE_CHECKING:  # dataclasses and typing make each start 13 ms slower
+    from typing import NoReturn
+
+__version__ = "2.4.2"  # increase it for every change: "cputune update" compares versions
 
 # The latest release, not main: raw.githubusercontent.com caches main for 5 minutes, and a
 # release exists only after the tests passed on main.
@@ -121,6 +123,17 @@ def die(msg: str) -> NoReturn:
     raise Error(msg)
 
 
+def is_root() -> bool:
+    """Root, or the tests: then cputune changes the files itself, without sudo."""
+    return os.geteuid() == 0 or TEST_MODE
+
+
+def pause(seconds: float) -> None:
+    """time.sleep, but not in tests: the fake files do not change anyway."""
+    if not TEST_MODE:
+        time.sleep(seconds)
+
+
 # ------------------------------------------------------------------ terminal output
 
 COLOR = False
@@ -143,7 +156,7 @@ GREEN = fg(78)
 YELLOW = fg(221)
 RED = fg(203)
 # Frequency colors, from cold (low MHz) to hot (high MHz).
-HEAT = (27, 33, 39, 45, 51, 50, 49, 48, 47, 46, 82, 118, 154, 190, 226, 220, 214, 208, 202, 196)
+HEAT = tuple(fg(n) for n in (27, 33, 39, 45, 51, 50, 49, 48, 47, 46, 82, 118, 154, 190, 226, 220, 214, 208, 202, 196))
 EIGHTHS = " ▏▎▍▌▋▊▉"
 
 
@@ -154,12 +167,15 @@ def paint(text: str, *codes: str) -> str:
 
 
 def heat(fraction: float) -> str:
-    i = round(max(0.0, min(1.0, fraction)) * (len(HEAT) - 1))
-    return fg(HEAT[i])
+    return HEAT[round(max(0.0, min(1.0, fraction)) * (len(HEAT) - 1))]
 
 
 def say(text: str = "") -> None:
     print(text, file=OUT)
+
+
+def say_ok(text: str) -> None:
+    say(paint("✓ ", BOLD, GREEN) + text)
 
 
 def warn(msg: str) -> None:
@@ -314,18 +330,21 @@ def is_boost_switch(path: Path) -> bool:
     )
 
 
-@dataclass
+# Core attribute and the cpufreq file that it comes from (kHz in the file, MHz in Core).
+CORE_FREQ_FILES = (("hw_min", "cpuinfo_min_freq"), ("hw_max", "cpuinfo_max_freq"),
+                   ("set_min", "scaling_min_freq"), ("set_max", "scaling_max_freq"))
+
+
 class Core:
     """One physical core, with all its SMT siblings. Frequencies are in MHz, 0 = unknown."""
 
-    cpus: tuple[int, ...]
-    rank: int
-    hw_min: int = 0
-    hw_max: int = 0
-    base: int | None = None
-    set_min: int = 0
-    set_max: int = 0
-    now: int | None = None
+    __slots__ = ("cpus", "rank", "hw_min", "hw_max", "base", "set_min", "set_max", "now")
+
+    def __init__(self, cpus: tuple[int, ...], rank: int, hw_min: int = 0, hw_max: int = 0,
+                 base: int | None = None, set_min: int = 0, set_max: int = 0) -> None:
+        self.cpus, self.rank, self.base = cpus, rank, base
+        self.hw_min, self.hw_max, self.set_min, self.set_max = hw_min, hw_max, set_min, set_max
+        self.now: int | None = None
 
     @property
     def has_freq(self) -> bool:
@@ -370,22 +389,9 @@ def get_cores() -> list[Core]:
     cores = []
     for cpus in groups:
         first = cpus[0]
-
-        def mhz(name: str, first: int = first) -> int:
-            return (read_int(fdir(first) / name) or 0) // 1000
-
         base = base_khz(first)
-        cores.append(
-            Core(
-                cpus=cpus,
-                rank=get_rank(first),
-                hw_min=mhz("cpuinfo_min_freq"),
-                hw_max=mhz("cpuinfo_max_freq"),
-                base=base // 1000 if base else None,
-                set_min=mhz("scaling_min_freq"),
-                set_max=mhz("scaling_max_freq"),
-            )
-        )
+        mhz = {attr: (read_int(fdir(first) / name) or 0) // 1000 for attr, name in CORE_FREQ_FILES}
+        cores.append(Core(cpus, get_rank(first), base=base // 1000 if base else None, **mhz))
     cores.sort(key=lambda c: (-c.rank, c.cpus))
     return cores
 
@@ -459,7 +465,7 @@ def state_exists() -> bool:
     now = read_str(BOOT_ID)
     if saved is None or now is None or saved == now:  # before 2.3.0, files had no boot ID
         return True
-    if os.geteuid() == 0 or TEST_MODE:
+    if is_root():
         try:
             STATE_FILE.unlink()
         except OSError:
@@ -474,7 +480,11 @@ def load_state() -> dict:
         return {"cpus": {}, "boost": {}}
     except (OSError, ValueError) as e:
         die(f"cannot read {STATE_SHOWN}: {e}. Delete it with: sudo rm {STATE_SHOWN}")
-    if not isinstance(state.get("cpus"), dict) or not isinstance(state.get("boost"), dict):
+    cpus = state.get("cpus") if isinstance(state, dict) else None
+    if not (isinstance(cpus, dict) and isinstance(state.get("boost"), dict) and all(
+        cpu.isdigit() and isinstance(saved, dict) and isinstance(saved.get("min"), int)
+        and isinstance(saved.get("max"), int) for cpu, saved in cpus.items()
+    )):
         die(f"{STATE_SHOWN} is damaged. Delete it with: sudo rm {STATE_SHOWN}")
     return state
 
@@ -499,16 +509,15 @@ def measure(cpus: list[int], seconds: float = 1.0) -> dict[int, int]:
     is the fallback.
     """
     samples = 5
-    interval = 0 if TEST_MODE else seconds / samples
-    sums = dict.fromkeys(cpus, 0)
+    values: dict[int, list[int]] = {cpu: [] for cpu in cpus}
     for i in range(samples):
         if i:
-            time.sleep(interval)
+            pause(seconds / samples)
         for cpu in cpus:
             d = fdir(cpu)
-            value = read_int(d / "cpuinfo_avg_freq") or read_int(d / "scaling_cur_freq") or 0
-            sums[cpu] += value
-    return {cpu: total // samples // 1000 for cpu, total in sums.items()}
+            if khz := read_int(d / "cpuinfo_avg_freq") or read_int(d / "scaling_cur_freq"):
+                values[cpu].append(khz)
+    return {cpu: sum(v) // len(v) // 1000 if v else 0 for cpu, v in values.items()}
 
 
 def measure_under_load(cpus: list[int]) -> dict[int, int]:
@@ -522,8 +531,9 @@ def measure_under_load(cpus: list[int]) -> dict[int, int]:
                 "except OSError: sys.exit()\n"
                 "while True: pass"
             )
-            procs.append(subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.DEVNULL))
-        time.sleep(0.3)
+            # -I -S: no site packages, no user paths. Starts faster, and needs only os and sys.
+            procs.append(subprocess.Popen([sys.executable, "-I", "-S", "-c", code], stdin=subprocess.DEVNULL))
+        pause(0.3)
     try:
         return measure(cpus, 0.7)
     finally:
@@ -584,7 +594,8 @@ def axis(scale: int, width: int, step: int) -> str:
     return "".join(chars).rstrip() + " GHz"
 
 
-def render_show(cores: list[Core], info: dict, measured: bool) -> list[str]:
+def render_show(cores: list[Core], info: dict, measured: bool, changed: list[int] | None) -> list[str]:
+    """The show text. changed: the CPUs that cputune changed (state_cpus())."""
     lines = []
     sep = paint(" · ", DARK)
 
@@ -654,7 +665,14 @@ def render_show(cores: list[Core], info: dict, measured: bool) -> list[str]:
         if hi_rank == lo_rank:
             return (WHITE,)
         f = (rank - lo_rank) / (hi_rank - lo_rank)
-        return (BOLD, GREEN) if f > 0.99 else (fg(150),) if f > 0.6 else (YELLOW,) if f > 0.3 else (ORANGE,)
+        if f > 0.99:
+            return (BOLD, GREEN)
+        if f > 0.6:
+            return (fg(150),)
+        return (YELLOW,) if f > 0.3 else (ORANGE,)
+
+    def num(mhz: int | None) -> str:
+        return f"{mhz or '–':>5}"
 
     if freq:
         lines.append(" " * left_w + paint(axis(scale, width, step), GRAY))
@@ -668,7 +686,6 @@ def render_show(cores: list[Core], info: dict, measured: bool) -> list[str]:
 
     for core in cores:
         star = paint("★", BOLD, YELLOW) if core.cpus == default else " "
-        num = lambda v: f"{v:>5}" if v else f"{'–':>5}"  # noqa: E731
         row = paint(f"{core.rank:>4}", *rank_color(core.rank))
         row += "  " + cpus_cell(core.cpus) + " " + star
         row += " " + paint(num(core.hw_min), GRAY) + " " + paint(num(core.base), GRAY)
@@ -700,7 +717,7 @@ def render_show(cores: list[Core], info: dict, measured: bool) -> list[str]:
         lines.append("")
         lines.append(paint("   ".join(legend) + "   (all values in MHz)", GRAY))
 
-    if (changed := state_cpus()) is not None:
+    if changed is not None:
         lines.append("")
         cpus = format_cpu_list(changed) if changed else "?"
         lines.append(
@@ -711,8 +728,7 @@ def render_show(cores: list[Core], info: dict, measured: bool) -> list[str]:
     return lines
 
 
-def show_json(cores: list[Core], info: dict, command: str) -> dict:
-    changed = state_cpus()
+def show_json(cores: list[Core], info: dict, command: str, changed: list[int] | None) -> dict:
     freq = [c for c in cores if c.has_freq]
     return {
         "ok": True,
@@ -737,12 +753,12 @@ def cmd_show(args: argparse.Namespace) -> None:
         now = measure([cpu for c in cores if c.has_freq for cpu in c.cpus])
         for core in cores:
             core.now = max((now.get(cpu, 0) for cpu in core.cpus), default=0) or None
-    info = system_info()
+    info, changed = system_info(), state_cpus()
     checks = run_checks(None)  # the machine only: at once, no load measurement
     if args.json:
-        print_json(show_json(cores, info, "show") | {"checks": checks})
+        print_json(show_json(cores, info, "show", changed) | {"checks": checks})
         return
-    lines = render_show(cores, info, args.now)
+    lines = render_show(cores, info, args.now, changed)
     # "changed" is in render_show already. The other notes: what can make results vary.
     if notes := [item for item in checks if item["level"] != "ok" and item["name"] != "changed"]:
         lines += ["", *render_checks(notes)]
@@ -774,10 +790,11 @@ class FdReader:
         self.fds.clear()
 
 
-def stay_away_from_benchmarks(allowed: set[int]) -> None:
-    """Run only on the allowed CPUs that cputune did not lock: watch must not disturb a benchmark."""
+def avoid_cpus(cpus, allowed: set[int] | None = None) -> None:
+    """Run cputune itself only on the other CPUs (of allowed, default: where it runs now), so that
+    it does not disturb a benchmark or its own measurement there."""
     try:
-        if keep := allowed - set(state_cpus() or []):
+        if keep := (os.sched_getaffinity(0) if allowed is None else allowed) - set(cpus):
             os.sched_setaffinity(0, keep)
     except OSError:
         pass
@@ -794,7 +811,9 @@ def cmd_watch(args: argparse.Namespace) -> None:
     next_rescan = 0.0
     cores: list[Core] = []
     info: dict = {}
-    sources: dict[int, Path] = {}
+    changed: list[int] | None = None
+    ranges: list[tuple[Core, str, Path]] = []  # what lock, limit and boost change
+    sources: dict[Core, list[Path]] = {}  # where the current frequency of each core is
     shown: list[str] = []
     columns = 0
     frames = 0
@@ -810,31 +829,27 @@ def cmd_watch(args: argparse.Namespace) -> None:
         while True:
             if time.monotonic() >= next_rescan:
                 reader.close()
-                stay_away_from_benchmarks(allowed)  # the locked CPUs can change
+                changed = state_cpus()
+                avoid_cpus(changed or [], allowed)  # the locked CPUs can change
                 cores, info = get_cores(), system_info()
-                sources = {}
-                for cpu in (cpu for c in cores if c.has_freq for cpu in c.cpus):
-                    avg = fdir(cpu) / "cpuinfo_avg_freq"
-                    sources[cpu] = avg if read_int(avg) is not None else fdir(cpu) / "scaling_cur_freq"
+                freq = [c for c in cores if c.has_freq]
+                ranges = [(c, attr, fdir(c.cpus[0]) / name) for c in freq for attr, name in CORE_FREQ_FILES]
+                sources = {c: [fdir(cpu) / "cpuinfo_avg_freq" if read_int(fdir(cpu) / "cpuinfo_avg_freq")
+                               is not None else fdir(cpu) / "scaling_cur_freq" for cpu in c.cpus] for c in freq}
                 next_rescan = time.monotonic() + rescan_every
             else:
-                for core in cores:  # lock, limit and boost change these
-                    if core.has_freq:
-                        d = fdir(core.cpus[0])
-                        for attr, name in (("hw_min", "cpuinfo_min_freq"), ("hw_max", "cpuinfo_max_freq"),
-                                           ("set_min", "scaling_min_freq"), ("set_max", "scaling_max_freq")):
-                            if (khz := reader.int(d / name)) is not None:
-                                setattr(core, attr, khz // 1000)
+                for core, attr, path in ranges:
+                    if (khz := reader.int(path)) is not None:
+                        setattr(core, attr, khz // 1000)
             for core in cores:
-                now = [reader.int(sources[cpu]) or 0 for cpu in core.cpus if cpu in sources]
-                core.now = max(now, default=0) // 1000 or None
+                core.now = max((reader.int(path) or 0 for path in sources.get(core, ())), default=0) // 1000 or None
 
             if args.json:
-                data = show_json(cores, info, "watch")
+                data = show_json(cores, info, "watch", changed)
                 data["time"] = time.time()
                 print(json.dumps(data), file=OUT, flush=True)
             else:
-                lines = render_show(cores, info, True)
+                lines = render_show(cores, info, True, changed)
                 lines.append(paint(f"{time.strftime('%H:%M:%S')}   Ctrl+C to stop", GRAY))
                 if not tty:
                     OUT.write("\n".join(lines) + "\n\n")
@@ -906,7 +921,7 @@ def cpu_times() -> dict[int, tuple[int, int]]:
 def busy_fractions(seconds: float) -> dict[int, float]:
     """How busy each CPU is (0.0 to 1.0), measured over some seconds."""
     before = cpu_times()
-    time.sleep(0 if TEST_MODE else seconds)
+    pause(seconds)
     after = cpu_times()
     busy = {}
     for cpu in before.keys() & after.keys():
@@ -916,21 +931,25 @@ def busy_fractions(seconds: float) -> dict[int, float]:
 
 
 def running_services() -> list[str]:
+    """The power services in POWER_SERVICES that run now. Reads /proc/PID/comm of each process."""
     found = set()
-    for path in (ROOT / "proc").glob("[0-9]*/comm"):
-        if (service := POWER_SERVICES.get(read_str(path) or "")) is not None:
-            found.add(service)
+    proc = ROOT / "proc"
+    for pid in os.listdir(proc):
+        if pid.isdigit():
+            try:
+                with open(proc / pid / "comm", encoding="utf8", errors="replace") as f:
+                    comm = f.read().strip()
+            except OSError:  # the process has ended
+                continue
+            if comm in POWER_SERVICES:
+                found.add(POWER_SERVICES[comm])
     return sorted(found)
 
 
 def load_checks(cpus: list[int], seconds: float, add) -> None:
     """Other load on the benchmark core and on the machine."""
     cpu_text = format_cpu_list(cpus)
-    try:  # do not measure the load that this check puts on the CPUs
-        if others := set(os.sched_getaffinity(0)) - set(cpus):
-            os.sched_setaffinity(0, others)
-    except OSError:
-        pass
+    avoid_cpus(cpus)  # do not measure the load that this check puts on the CPUs
     busy = busy_fractions(seconds)
     if busy:
         loaded = [cpu for cpu in cpus if busy.get(cpu, 0) >= 0.1]
@@ -965,12 +984,14 @@ def run_checks(cpus: list[int] | None, seconds: float = 0.5) -> list[dict]:
         load_checks(cpus, seconds, add)
 
     if services := running_services():
-        names = " and ".join([", ".join(services[:-1]), services[-1]] if len(services) > 1 else services)
-        one = len(services) == 1
-        add("note", "service", f"{names} {'runs' if one else 'run'}: power service{'' if one else 's'} of the "
-            f"system, not started by cputune. {'It' if one else 'They'} can change CPU settings. cputune run "
-            "warns when this changes a lock.",
-            f"To stop {'it' if one else 'them'} until the next reboot: sudo systemctl stop {' '.join(services)}")
+        if len(services) == 1:
+            names, runs, they, them = services[0], "runs: a power service", "It", "it"
+        else:
+            names, runs, they, them = f"{', '.join(services[:-1])} and {services[-1]}", "run: power services", \
+                "They", "them"
+        add("note", "service", f"{names} {runs} of the system, not started by cputune. {they} can change CPU "
+            "settings. cputune run warns when this changes a lock.",
+            f"To stop {them} until the next reboot: sudo systemctl stop {' '.join(services)}")
     else:
         add("ok", "service", "No power service runs (power-profiles-daemon, tuned, auto-cpufreq).")
 
@@ -1013,7 +1034,7 @@ def render_checks(items: list[dict], indent: str = "") -> list[str]:
 
 def cmd_check(args: argparse.Namespace) -> None:
     """Hidden since 2.4.0: cputune shows these notes, and run checks the load. Kept for scripts."""
-    cpus = select_cpus(args.cpu, [] if args.cpu else list(default_lock_core(get_cores()).cpus))
+    cpus = select_cpus(args.cpu)
     items = run_checks(cpus)
     warnings = sum(item["level"] == "warn" for item in items)
     if args.json:
@@ -1026,7 +1047,7 @@ def cmd_check(args: argparse.Namespace) -> None:
     if warnings:
         say(paint(f"{warnings} problem{'s' if warnings > 1 else ''} can make results vary.", BOLD, YELLOW))
     else:
-        say(paint("✓ ", BOLD, GREEN) + "Nothing found that makes results vary.")
+        say_ok("Nothing found that makes results vary.")
 
 
 # ------------------------------------------------------------------ root
@@ -1067,13 +1088,11 @@ def file_version(path: Path) -> str | None:
 def root_command(argv: list[str]) -> list[str]:
     """The command that runs cputune with argv as root."""
     script = script_path()
-    if os.geteuid() == 0 or TEST_MODE:
+    if is_root():
         return [sys.executable, script, *argv]
     copy = root_copy()
     run = [copy] if os.access(copy, os.X_OK) else [sys.executable, copy]
-    if sys.stdin.isatty():
-        return ["sudo", *run, *argv]
-    return ["sudo", "-n", *run, *argv]  # no terminal: never wait for a password
+    return [*sudo_prefix(), *run, *argv]
 
 
 def run_root(argv: list[str], capture: bool = False) -> subprocess.CompletedProcess:
@@ -1100,7 +1119,7 @@ def run_root(argv: list[str], capture: bool = False) -> subprocess.CompletedProc
 
 def ensure_root(args: argparse.Namespace) -> None:
     """Run this command again as root, and exit with its exit code. No-op when root."""
-    if os.geteuid() == 0 or TEST_MODE:
+    if is_root():
         return
     sys.exit(run_root(args.argv).returncode)
 
@@ -1168,13 +1187,15 @@ def save_state(cpus: list[int], exclusive: bool) -> None:
         f.write(text)
 
 
-def select_cpus(spec: str | None, default: list[int]) -> list[int]:
-    """The CPUs of a --cpu value, with all their SMT siblings."""
+def select_cpus(spec: str | None, default: list[int] | None = None) -> list[int]:
+    """The CPUs of a --cpu value, with all their SMT siblings. Without --cpu: default, else the
+    best core (the one that lock and run use)."""
     available = set(freq_cpus())
     if not available:
         die("no CPU has cpufreq (no cpufreq driver loaded?)")
+    cores = get_cores()
     if spec is None:
-        wanted = default
+        wanted = list(default_lock_core(cores).cpus) if default is None else default
     elif spec.strip() == "all":
         wanted = sorted(available)
     else:
@@ -1186,7 +1207,7 @@ def select_cpus(spec: str | None, default: list[int]) -> list[int]:
         if cpu not in available:
             die(f"cpu{cpu} has no cpufreq (it is offline, or it does not exist)")
     selected = set(wanted)
-    for core in get_cores():
+    for core in cores:
         if selected & set(core.cpus):
             selected |= set(core.cpus) & available
     return sorted(selected)
@@ -1198,6 +1219,8 @@ def parse_freq(text: str) -> int | str:
     if t in ("base", "min", "max"):
         return t
     if m := re.fullmatch(r"(\d+(?:\.\d+)?)(ghz|mhz|g|m)?", t):
+        if "." in m[1] and not m[2]:  # MHz have no decimals: 2.4 is 2.4 GHz, not 2 MHz
+            raise argparse.ArgumentTypeError(f'bad frequency "{text}". Did you mean {m[1]}GHz?')
         return round(float(m[1]) * (1000 if m[2] in ("ghz", "g") else 1))
     raise argparse.ArgumentTypeError(
         f'bad frequency "{text}". Examples: 2400, 2400MHz, 2.4GHz, base, min, max'
@@ -1224,6 +1247,11 @@ def target_khz(cpu: int, freq: int | str, clamp: bool) -> int:
     return khz
 
 
+def tolerance_mhz(mhz: int) -> float:
+    """How far a measured frequency can be from the lock and still count as the lock."""
+    return max(50, mhz * 0.03)
+
+
 def lowest_lock_khz(cpu: int) -> int:
     """The lowest frequency that a lock can hold. amd-pstate: the CPU does not follow a request
     below lowest_nonlinear_freq (Ryzen 9 7950X: 425 MHz requested, 2170 MHz measured)."""
@@ -1234,7 +1262,7 @@ def lowest_lock_khz(cpu: int) -> int:
 def cmd_lock(args: argparse.Namespace) -> None:
     freq = args.freq if args.freq is not None else "base"
     ensure_root(args)
-    cpus = select_cpus(args.cpu, [] if args.cpu else list(default_lock_core(get_cores()).cpus))
+    cpus = select_cpus(args.cpu)
     if isinstance(freq, int):
         for cpu in cpus:  # check before any change
             target_khz(cpu, freq, clamp=False)
@@ -1245,7 +1273,17 @@ def cmd_lock(args: argparse.Namespace) -> None:
                     "lock turns boost off, so it can lock at most the base frequency."
                 )
     save_state(cpus, args.exclusive)
+    try:
+        cores, scope, governors = lock_cpus(cpus, freq)
+    except Error as e:
+        end = "" if str(e).endswith((".", "?")) else "."
+        die(f"{e}{end} Settings are partly changed. Undo with: cputune reset")
+    report_lock(args, cpus, cores, scope, governors)
 
+
+def lock_cpus(cpus: list[int], freq: int | str) -> tuple[list[dict], str, set[str]]:
+    """Boost off, then minimum = maximum = target. Returns the measured cores, the boost scope
+    ("core", "global" or "none") and the governors."""
     # 1. Boost off. The hardware range can get smaller with it, so this comes first.
     switches = {}
     for cpu in cpus:
@@ -1253,17 +1291,16 @@ def cmd_lock(args: argparse.Namespace) -> None:
             switches[switch[0]] = switch
     for path, off, _ in switches.values():
         write(path, off)
-    scope = "none" if not switches else "core" if all(s[2] == "core" for s in switches.values()) else "global"
-    if scope == "none":
+    if not switches:
+        scope = "none"
         warn("no boost switch found, boost stays as it is")
+    elif all(s[2] == "core" for s in switches.values()):
+        scope = "core"
+    else:
+        scope = "global"
 
     # 2. Check all targets. The range is checked again, because boost is off now.
-    targets = {}
-    for cpu in cpus:
-        try:
-            targets[cpu] = lowest_lock_khz(cpu) if freq == "min" else target_khz(cpu, freq, clamp=False)
-        except Error as e:
-            die(f"{e} Boost is off now. Undo with: cputune reset")
+    targets = {cpu: lowest_lock_khz(cpu) if freq == "min" else target_khz(cpu, freq, clamp=False) for cpu in cpus}
 
     # 3. The performance governor, so the core does not drop below the minimum.
     # 4. Minimum = maximum = target.
@@ -1286,14 +1323,17 @@ def cmd_lock(args: argparse.Namespace) -> None:
         # The CPU firmware can run a core a little below the lock (Ryzen 9 7950X: 4304 MHz for 4501,
         # 2729 for 3000), but always at the same frequency. That is stable, so it is no problem.
         # Faster than the lock: boost is still on, or the CPU does not go this low.
-        ok = bool(got) and got <= want + max(50, want * 0.03)
+        ok = bool(got) and got <= want + tolerance_mhz(want)
         cores.append({"cpus": siblings, "target_mhz": want, "measured_mhz": got or None, "ok": ok})
         if not got:
             warn(f"cpu{cpu}: cannot measure the frequency under load")
         elif not ok:
             warn(f"cpu{cpu}: measured {got} MHz under load, faster than the lock {want} MHz. "
                  "Boost is still on, or the CPU does not go this low.")
+    return cores, scope, governors
 
+
+def report_lock(args: argparse.Namespace, cpus: list[int], cores: list[dict], scope: str, governors: set[str]) -> None:
     # A benchmark runs on the CPUs that the user named, as with taskset. The lock covers the
     # whole physical core, because SMT siblings share one frequency. Without --cpu: all of it.
     pin = cpus if args.cpu is None or args.cpu.strip() == "all" else sorted(set(parse_cpu_list(args.cpu)))
@@ -1337,7 +1377,7 @@ def cmd_lock(args: argparse.Namespace) -> None:
 def below_note(core: dict) -> str:
     """A note when the core runs clearly below the lock: the CPU firmware sets this frequency."""
     want, got = core["target_mhz"], core["measured_mhz"]
-    if not got or got >= want - max(50, want * 0.03):
+    if not got or got >= want - tolerance_mhz(want):
         return ""
     return paint(f" ({(want - got) / want:.0%} below the lock: the CPU firmware sets this frequency)", GRAY)
 
@@ -1359,7 +1399,7 @@ def cmd_limit(args: argparse.Namespace) -> None:
     if args.json:
         print_json({"ok": True, "command": "limit", "cpus": cpus, "ranges": ranges, "undo": "cputune reset"})
         return
-    say("\n".join(render_show(get_cores(), system_info(), False)))
+    say("\n".join(render_show(get_cores(), system_info(), False, state_cpus())))
 
 
 def cmd_reset(args: argparse.Namespace) -> None:
@@ -1409,7 +1449,7 @@ def cmd_reset(args: argparse.Namespace) -> None:
         print_json({"ok": True, "command": "reset", "restored": True, "cpus": sorted(restored)})
     else:
         cpus = format_cpu_list(restored)
-        say(paint("✓ ", BOLD, GREEN) + f"Restored cpu {cpus}: boost, governor and frequency range.")
+        say_ok(f"Restored cpu {cpus}: boost, governor and frequency range.")
 
 
 def throttle_count(cpu: int) -> int | None:
@@ -1426,7 +1466,7 @@ def lock_settings(cpus: list[int]) -> dict[str, str | None]:
     paths = {fdir(cpu) / name for cpu in cpus for name in
              ("scaling_min_freq", "scaling_max_freq", "scaling_governor", "energy_performance_preference")}
     paths |= {switch[0] for cpu in cpus if (switch := boost_switch(cpu))}
-    return {str(path): read_str(path) for path in sorted(paths) if path.exists()}
+    return {str(path): read_str(path) for path in sorted(paths)}  # None: no such file
 
 
 def sample_frequencies(cpus: list[int], stop: threading.Event, samples: dict[int, list[int]]) -> None:
@@ -1461,9 +1501,13 @@ def cmd_run(args: argparse.Namespace) -> None:
         problems.append(text)
         warn(text)
 
+    def note(text: str) -> None:  # run's own messages, on stderr: stdout belongs to the command
+        if not args.json:
+            say(paint("cputune: ", GRAY) + text)
+
     # 1. Checks, as the user and before any change. lock reports a bad --cpu.
     try:
-        check_cpus = select_cpus(args.cpu, [] if args.cpu else list(default_lock_core(get_cores()).cpus))
+        check_cpus = select_cpus(args.cpu)
     except Error:
         check_cpus = []
     if check_cpus:
@@ -1478,17 +1522,11 @@ def cmd_run(args: argparse.Namespace) -> None:
     if args.cpu is not None:
         lock += ["--cpu", args.cpu]
 
-    existed = state_exists()
-    result = run_root(lock, capture=True)
-    try:
-        locked = json.loads(result.stdout)
-    except ValueError:
-        locked = {"ok": False, "error": result.stdout.strip() or "lock failed"}
-    if result.returncode != 0 or not locked.get("ok"):
-        if not existed and state_exists():  # the lock changed something before it failed
-            run_root(["reset", "--json", "--color=never"], capture=True)
-        die(f"lock failed: {locked.get('error', 'unknown error')}")
+    def stop(signum, frame):
+        raise SystemExit(128 + signum)
 
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGHUP, stop)
     def reset() -> bool:
         try:
             done = run_root(["reset", "--json", "--color=never"], capture=True)
@@ -1498,33 +1536,40 @@ def cmd_run(args: argparse.Namespace) -> None:
             warn(f"reset failed. Undo by hand with: cputune reset\n{done.stdout.strip()}")
         return done.returncode == 0
 
+    existed = state_exists()
+    try:
+        result = run_root(lock, capture=True)
+        try:
+            locked = json.loads(result.stdout)
+        except ValueError:
+            locked = {"ok": False, "error": result.stdout.strip() or "lock failed"}
+        if result.returncode != 0 or not locked.get("ok"):
+            die(f"lock failed: {locked.get('error', 'unknown error')}")
+    except BaseException:  # the lock failed, or Ctrl+C or SIGTERM while it ran: undo what it changed
+        if not existed and state_exists():
+            reset()
+        raise
+
     cpus = locked["cpus"]
     cores = locked["cores"]
     pin = locked.get("pin_cpus", cpus)
-    unverified = [c for c in cores if not c["ok"]]
-    for core in unverified:
-        problems.append(f"cpu {format_cpu_list(core['cpus'])}: measured {core['measured_mhz'] or '?'} MHz "
-                        f"under load, faster than the lock {core['target_mhz']} MHz")  # lock warned already
-    if args.strict and unverified:
+    not_held = [  # lock warned already
+        f"cpu {format_cpu_list(c['cpus'])}: measured {c['measured_mhz']} MHz under load, faster than the lock "
+        f"{c['target_mhz']} MHz" if c["measured_mhz"] else
+        f"cpu {format_cpu_list(c['cpus'])}: cannot measure the frequency under load"
+        for c in cores if not c["ok"]
+    ]
+    problems += not_held
+    if args.strict and not_held:
         reset()
-        die(f"the lock is not verified: {'; '.join(problems[-len(unverified):])}. "
-            "With --strict, the command does not run.")
+        die(f"the lock is not verified: {'; '.join(not_held)}. With --strict, the command does not run.")
 
     mhz = ",".join(str(c["target_mhz"]) for c in cores)
     measured = ",".join(str(c["measured_mhz"]) for c in cores)
-    if not args.json:
-        say(
-            paint("cputune: ", GRAY)
-            + f"locked cpu {paint(format_cpu_list(cpus), BOLD, WHITE)} at {paint(mhz + ' MHz', BOLD, MAGENTA)}"
-            + paint(f" (measured {measured} MHz), running on cpu {format_cpu_list(pin)}: {' '.join(args.command)}",
-                    GRAY)
-        )
+    note(f"locked cpu {paint(format_cpu_list(cpus), BOLD, WHITE)} at {paint(mhz + ' MHz', BOLD, MAGENTA)}"
+         + paint(f" (measured {measured} MHz), running on cpu {format_cpu_list(pin)}: {' '.join(args.command)}",
+                 GRAY))
 
-    def stop(signum, frame):
-        raise SystemExit(128 + signum)
-
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGHUP, stop)
     # 3. Run the command on the pinned CPUs. Meanwhile, cputune samples the frequency from other CPUs.
     groups = [[cpu for cpu in core["cpus"] if cpu in pin] for core in cores]  # where the command runs
     throttled_before = [throttle_count(core["cpus"][0]) for core in cores]
@@ -1546,11 +1591,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             proc = subprocess.Popen(args.command, env=env)
         except OSError as e:
             die(f"cannot run {args.command[0]}: {e.strerror}")
-        try:  # cputune itself leaves the locked cores to the command
-            if others := allowed - set(cpus):
-                os.sched_setaffinity(0, others)
-        except OSError:
-            pass
+        avoid_cpus(cpus, allowed)  # cputune itself leaves the locked cores to the command
         sampler.start()
         try:
             returncode = proc.wait()
@@ -1566,7 +1607,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         changed = [path for path, value in settings.items() if read_str(Path(path)) != value]
         if changed:
             problem("another program changed the lock while the command ran: "
-                    f"{', '.join(changed)}. Check with: cputune check")
+                    f"{', '.join(changed)}. Check with: cputune")
         for core, group, before in zip(cores, groups, throttled_before):
             values = [mhz for cpu in group for mhz in samples[cpu]]
             core["run_avg_mhz"] = round(sum(values) / len(values)) if values else None
@@ -1576,24 +1617,21 @@ def cmd_run(args: argparse.Namespace) -> None:
             # Compare with the frequency that lock measured: the firmware can hold a lock below the target.
             where, avg = format_cpu_list(core["cpus"]), core["run_avg_mhz"]
             want = min(core["measured_mhz"] or core["target_mhz"], core["target_mhz"])
-            if not args.json:
-                text = f"cpu {where} ran at {avg or '?'} MHz (lowest {core['run_min_mhz'] or '?'} MHz)"
-                if core["throttled"] == 0:
-                    text += ", not throttled"
-                say(paint("cputune: ", GRAY) + text)
-            if avg is not None and abs(avg - want) > max(50, want * 0.03):
+            note(f"cpu {where} ran at {avg or '?'} MHz (lowest {core['run_min_mhz'] or '?'} MHz)"
+                 + (", not throttled" if core["throttled"] == 0 else ""))
+            if avg is not None and abs(avg - want) > tolerance_mhz(want):
                 why = "too hot, or at its power limit" if avg < want else "did another program change the lock?"
                 problem(f"cpu {where} ran at {avg} MHz on average while the command ran, but at {want} MHz "
                         f"after the lock ({why})")
             if core["throttled"]:
                 problem(f"cpu {where} was too hot and ran slower {core['throttled']} times while the command ran")
     finally:
-        if reset() and not args.json:
-            say(paint("cputune: ", GRAY) + f"reset done. The command exited with {returncode}.")
+        if reset():
+            note(f"reset done. The command exited with {returncode}.")
 
     stable = not problems
-    if not args.json and not stable:
-        say(paint("cputune: ", GRAY) + paint("the result may vary: see the warnings above.", BOLD, YELLOW))
+    if not stable:
+        note(paint("the result may vary: see the warnings above.", BOLD, YELLOW))
     if args.json:
         print_json({
             "ok": True,
@@ -1603,7 +1641,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             "cores": cores,
             "exit_code": returncode,
             "stable": stable,
-        } | ({"warnings": locked.get("warnings", []) + WARNINGS} if locked.get("warnings") or WARNINGS else {}))
+        } | ({"warnings": locked["warnings"] + WARNINGS} if locked.get("warnings") else {}))  # print_json adds WARNINGS
     sys.exit(returncode)
 
 
@@ -1712,16 +1750,21 @@ def render_sudoers(status: dict) -> list[str]:
     return lines
 
 
-def sudoers_install(status: dict) -> list[str]:
+def sudoers_text(status: dict) -> str:
+    """The file /etc/sudoers.d/cputune: a comment and the rule."""
+    return (f"# {SUDOERS_FILE}: {status['user']} can run {status['path']} as root without a password.\n"
+            f"{status['rule']}\n")
+
+
+def sudoers_install(status: dict, no_check: bool = False) -> list[str]:
     """Install the root-owned copy when it is missing or old, then the checked rule. Returns what it did."""
     done = []
     if not status["installed"] or status["outdated"]:
-        target, version, origin, notes = install_copy(system=True, no_check=False)
+        target, version, origin, notes = install_copy(system=True, no_check=no_check)
         done += [f"Installed cputune {version} from {origin} to {target}", *notes]
     if status["works"]:
         return done
-    rule = f"# {SUDOERS_FILE}: {status['user']} can run {status['path']} as root without a password.\n"
-    rule += status["rule"] + "\n"
+    rule = sudoers_text(status)
     if not TEST_MODE:
         fd, name = tempfile.mkstemp(prefix="cputune.sudoers.")
         with os.fdopen(fd, "w") as f:
@@ -1743,26 +1786,24 @@ def cmd_sudoers(args: argparse.Namespace) -> None:
         if not status["installed"]:
             warn(f"the rule is for {status['path']}. Install cputune there first: "
                  f"{self_command()} install --system")
-        say(f"# {SUDOERS_FILE}: {status['user']} can run {status['path']} as root without a password.")
-        say(status["rule"])
+        say(sudoers_text(status).rstrip("\n"))
         return
     legacy_note()
     if args.install:
-        done = [] if status["works"] and not status["outdated"] else sudoers_install(status)
+        done = [] if status["works"] and not status["outdated"] else sudoers_install(status, args.no_check)
         status = sudoers_status()
         if status["works"] is False:
             warn("the rule is installed, but sudo still asks for a password. "
                  "Check the other rules in /etc/sudoers and /etc/sudoers.d.")
         status["done"] = done
     if args.json:
-        print_json({"ok": True, "command": "install" if getattr(args, "no_password", False) else "sudoers",
-                    **status})
+        print_json({"ok": True, "command": args.name, **status})
         return
     for line in status.get("done", []):
-        say(paint("✓ ", BOLD, GREEN) + line)
+        say_ok(line)
     if args.install and status["works"] is not False:
         if status["works"]:
-            say(paint("✓ ", BOLD, GREEN) + f"{status['user']} can run {status['path']} as root without a password.")
+            say_ok(f"{status['user']} can run {status['path']} as root without a password.")
         say(paint(f"Undo: {status['undo']}", GRAY))
         return
     say("\n".join(render_sudoers(status)))
@@ -1945,8 +1986,7 @@ def legacy_note() -> None:
 def cmd_install(args: argparse.Namespace) -> None:
     """Installs the newest release, or updates to it. Replaces "update" and "sudoers --install"."""
     if args.no_password:
-        args.install, args.rule = True, False
-        cmd_sudoers(args)
+        cmd_sudoers(args)  # its parser defaults: install=True, rule=False
         return
     target, version, origin, notes = install_copy(args.system, args.no_check)
     path_note(target)  # before the output, so that --json has the warnings
@@ -1956,9 +1996,9 @@ def cmd_install(args: argparse.Namespace) -> None:
                     "notes": notes})
     else:
         where = paint(str(target), BOLD, WHITE)
-        say(paint("✓ ", BOLD, GREEN) + f"Installed cputune {version} from {origin} to {where}")
+        say_ok(f"Installed cputune {version} from {origin} to {where}")
         for note in notes:
-            say(paint("✓ ", BOLD, GREEN) + note)
+            say_ok(note)
 
 
 def cmd_update(args: argparse.Namespace) -> None:
@@ -1979,9 +2019,9 @@ def cmd_update(args: argparse.Namespace) -> None:
         replace_file(path, source)
     if not args.json:
         if updated:
-            say(paint("✓ ", BOLD, GREEN) + f"Updated {path}: cputune {old} -> {paint(new or '?', BOLD, WHITE)}")
+            say_ok(f"Updated {path}: cputune {old} -> {paint(new or '?', BOLD, WHITE)}")
         else:
-            say(paint("✓ ", BOLD, GREEN) + f"cputune {old} is up to date (GitHub has {new}).")
+            say_ok(f"cputune {old} is up to date (GitHub has {new}).")
     root = update_root_copy(path, new, args.json)
     if args.json:
         print_json({"ok": True, "command": "update", "path": str(path), "old_version": old,
@@ -2061,7 +2101,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=HelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"cputune {__version__}")
-    sub = parser.add_subparsers(prog="cputune", help=argparse.SUPPRESS)  # HELP groups the commands by task
+    sub = parser.add_subparsers(prog="cputune", dest="name", help=argparse.SUPPRESS)  # HELP groups the commands by task
     cpu_help = "CPUs to use; their SMT siblings are locked too (default: the best-ranked core without CPU 0)"
 
     watch = argparse.ArgumentParser(add_help=False)
@@ -2108,7 +2148,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("sudoers", parents=[common], help="show how to run cputune without a password prompt")
     p.add_argument("--install", action="store_true", help="set it up: install the rule (and cputune, if needed)")
     p.add_argument("--rule", action="store_true", help="print only the sudo rule")
-    p.set_defaults(func=cmd_sudoers)
+    p.set_defaults(func=cmd_sudoers, no_check=False)
 
     p = sub.add_parser(
         "install", parents=[common], help="install to ~/.local/bin, or to /usr/local/bin with --system",
@@ -2120,7 +2160,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="also allow lock, run, limit and reset without a password: installs to /usr/local/bin "
                    "and adds a sudo rule for that copy (uses sudo)")
     p.add_argument("--no-check", action="store_true", help="install this file, do not look on GitHub")
-    p.set_defaults(func=cmd_install)
+    p.set_defaults(func=cmd_install, install=True, rule=False)  # install, rule: for --no-password
 
     p = sub.add_parser("update", parents=[common], help="update this copy to the newest version on GitHub")
     p.set_defaults(func=cmd_update)
@@ -2150,16 +2190,17 @@ def main() -> int:
         i = argv.index("--")
         argv, command = argv[:i], argv[i + 1 :]
     argv = with_default_command(argv)
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     args.command = command
     args.json = getattr(args, "json", False)
-    if args.func is cmd_run:
+    if args.name == "run":
         OUT = sys.stderr
     COLOR = not args.json and want_color(getattr(args, "color", "auto"), OUT)
     args.argv = [*argv, f"--color={'always' if COLOR else 'never'}"]  # for the run as root
-    name = args.func.__name__[len("cmd_"):]
+    name = args.name
     if command and args.func is not cmd_run:
-        build_parser().error("'-- COMMAND' is only for: cputune run [FREQ] [--cpu CPUS] -- COMMAND")
+        parser.error("'-- COMMAND' is only for: cputune run [FREQ] [--cpu CPUS] -- COMMAND")
     if UNDER_SUDO and name not in SUDO_COMMANDS:
         print(f"cputune: error: do not start 'cputune {name}' with sudo. cputune runs sudo "
               f"itself when it needs root. Under sudo, only these commands work: {', '.join(SUDO_COMMANDS)}",
