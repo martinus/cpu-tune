@@ -1,0 +1,12 @@
+CPU Model: Raspberry Pi 4 Model B Rev 1.2
+Governor:  ondemand (conservative, ondemand, userspace, powersave, performance, schedutil)
+Turbo:     unknown
+Driver:    cpufreq-dt
+Kernel:    6.1.0-rpi8-rpi-v8 #1 SMP PREEMPT Debian 1:6.1.73-1+rpt1 (2024-01-25)
+
+Rank | CPU IDs | MHz min | MHz max
+----:|:--------|--------:|--------:
+ 100 |       0 |     600 |    1500
+ 100 |       1 |     600 |    1500
+ 100 |       2 |     600 |    1500
+ 100 |       3 |     600 |    1500
