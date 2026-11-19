@@ -290,12 +290,23 @@ class LockTest(Case):
         self.assertEqual((self.cpu / "intel_pstate/no_turbo").read_text().strip(), "0")
 
     def test_measured_mismatch_warns(self) -> None:
-        # The fake tree reports 3100 MHz, so the measurement cannot match the lock.
+        # The fake tree reports 3100 MHz: faster than the lock, so boost is still on.
         data = self.json("lock")
         self.assertFalse(data["cores"][0]["ok"])
-        self.assertIn("measured 3100 MHz", data["warnings"][0])
+        self.assertIn("measured 3100 MHz under load, faster than the lock 2200 MHz", data["warnings"][0])
         self.set_f(8, "scaling_cur_freq", 2200000)
         self.assertTrue(self.json("lock")["cores"][0]["ok"])
+
+    def test_below_the_lock_is_stable(self) -> None:
+        # The CPU firmware can hold a lock a little below the target (Ryzen 9 7950X: 2729 MHz for 3000).
+        self.set_f(8, "scaling_cur_freq", 2000000)
+        data = self.json("lock")
+        self.assertTrue(data["cores"][0]["ok"])
+        self.assertNotIn("warnings", data)
+        text = self.ok("lock").stdout
+        self.assertIn("measured under load: 2000 MHz ✓ (9% below the lock: the CPU firmware sets this", text)
+        self.set_f(8, "scaling_cur_freq", 2180000)  # within 3%: no note
+        self.assertNotIn("below the lock", self.ok("lock").stdout)
 
 
 class LockAmdTest(Case):
@@ -310,6 +321,15 @@ class LockAmdTest(Case):
             self.assertEqual(self.f(cpu, "boost"), "0" if cpu in (1, 17) else "1", cpu)
         self.assertEqual((self.cpu / "cpufreq/boost").read_text().strip(), "1")
         self.assertEqual(self.json("show")["system"]["boost_off_cpus"], [1, 17])
+
+    def test_min_is_the_lowest_frequency_the_cpu_follows(self) -> None:
+        # amd-pstate: below lowest_nonlinear_freq the CPU does not follow (425 MHz requested, 2170 measured).
+        data = self.json("lock", "min", "--cpu", "2")
+        self.assertEqual(data["cores"][0]["target_mhz"], 3012)
+        self.assertEqual((self.f(2, "scaling_min_freq"), self.f(2, "scaling_max_freq")), ("3012480", "3012480"))
+        self.ok("reset")
+        self.ok("limit", "--max", "min")  # limit keeps the hardware minimum
+        self.assertEqual(self.f(2, "scaling_max_freq"), "425000")
 
 
 class LockAcpiTest(Case):
@@ -537,19 +557,34 @@ class RunTest(Case):
         self.assertEqual((core["run_min_mhz"], core["throttled"]), (1500, 3))
         warnings = "\n".join(data["warnings"])
         self.assertIn("cpu 8,9 was too hot and ran slower 3 times", warnings)
-        self.assertIn("but the lock is 2200 MHz (too hot, or at its power limit)", warnings)
+        self.assertIn("but at 2200 MHz after the lock (too hot, or at its power limit)", warnings)
         self.assertIn(f"another program changed the lock while the command ran: {self.cpu}/intel_pstate/no_turbo",
                       warnings)
         self.assertFalse(self.state.exists())  # reset
 
     def test_warns_about_what_check_finds(self) -> None:
-        fake_sysfs.w(self.root / "proc/4321/comm", "power-profiles-")
+        fake_sysfs.w(self.root / "proc/4321/comm", "power-profiles-")  # a note only: run sees real changes
         for cpu in (8, 9):
             self.set_f(cpu, "scaling_cur_freq", 2200000)
+        self.assertTrue(self.run_json("--", "true")["stable"])
+        (self.root / "sys/class/power_supply/AC/online").write_text("0\n")
         data = self.run_json("--", "true")
         self.assertFalse(data["stable"])
-        self.assertIn("power-profiles-daemon runs", data["warnings"][0])
-        self.assertIn("sudo systemctl stop power-profiles-daemon", data["warnings"][0])
+        self.assertEqual(data["warnings"], ["the computer runs on battery. Then the CPU often has lower power "
+                                            "limits. Connect the power supply."])
+
+    def test_compares_with_the_measured_lock(self) -> None:
+        for cpu in (8, 9):
+            self.set_f(cpu, "scaling_cur_freq", 2000000)  # the firmware holds the lock below 2200 MHz
+        data = self.run_json("--", "true")
+        self.assertTrue(data["stable"])
+        self.assertEqual(data["cores"][0]["run_avg_mhz"], 2000)
+        cur = self.cpu / "cpu8/cpufreq/scaling_cur_freq"
+        code = f"from pathlib import Path; Path({str(cur)!r}).write_text('1800000')"
+        data = self.run_json("--", sys.executable, "-c", code)
+        self.assertFalse(data["stable"])
+        self.assertIn("ran at 1900 MHz on average while the command ran, but at 2000 MHz after the lock",
+                      data["warnings"][0])
 
     def test_strict(self) -> None:
         before = self.snapshot()
@@ -592,11 +627,13 @@ class CheckTest(Case):
         self.assertEqual(data["cpus"], [0, 1])
         self.assertFalse(data["clean"])
         warnings = [item["fix"] for item in data["checks"] if item["level"] == "warn"]
-        self.assertEqual(warnings, ["cputune reset", "Stop it until the next reboot: sudo systemctl stop "
-                                    "power-profiles-daemon", "Stop it until the next reboot: sudo systemctl "
-                                    "stop tuned", "Connect the power supply."])
-        self.assertEqual([i["name"] for i in data["checks"] if i["level"] == "note"], ["aslr", "cpu 0"])
-        self.assertIn("4 problems can make results vary.", self.ok("check", "--cpu", "0").stdout)
+        self.assertEqual(warnings, ["cputune reset", "Connect the power supply."])
+        notes = {i["name"]: i for i in data["checks"] if i["level"] == "note"}
+        self.assertEqual(list(notes), ["service", "aslr", "cpu 0"])
+        self.assertIn("power-profiles-daemon, tuned can change boost", notes["service"]["text"])
+        self.assertEqual(notes["service"]["fix"],
+                         "Stop until the next reboot: sudo systemctl stop power-profiles-daemon tuned")
+        self.assertIn("2 problems can make results vary.", self.ok("check", "--cpu", "0").stdout)
 
     def test_desktop_without_aslr(self) -> None:
         shutil.rmtree(self.root)
