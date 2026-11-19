@@ -1,10 +1,23 @@
+<div align="center">
+
 # cputune
 
-`cputune` shows the CPU cores of a Linux machine ranked by speed, and locks
-their frequency, so that benchmarks give stable results. It is one Python file
-(3.9 or newer) with no dependencies.
+**Stable benchmarks on Linux.**<br>
+Rank the CPU cores by speed, lock one at a fixed frequency, and run your benchmark on it.
 
-![cputune --now on a Ryzen 9 7950X, with load on three cores](docs/show.png)
+[![test](https://github.com/martinus/cputune/actions/workflows/test.yml/badge.svg)](https://github.com/martinus/cputune/actions/workflows/test.yml)
+[![release](https://img.shields.io/github/v/release/martinus/cputune)](https://github.com/martinus/cputune/releases/latest)
+![python](https://img.shields.io/badge/python-3.9%2B-3776ab)
+![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
+[![license](https://img.shields.io/badge/license-0BSD-lightgrey)](LICENSE)
+
+<img src="docs/show.png" alt="cputune --now on a Ryzen 9 7950X, with load on three cores" width="820">
+
+</div>
+
+Boost, power-saving governors and heat change the CPU frequency while a benchmark runs, so the same
+code gets different times. `cputune` turns boost off, fixes the frequency of one core, pins the
+benchmark to it, and tells you when the result can still vary.
 
 ## Install
 
@@ -12,63 +25,62 @@ their frequency, so that benchmarks give stable results. It is one Python file
 curl -fsSL https://github.com/martinus/cputune/releases/latest/download/cputune | python3 - install
 ```
 
-This installs the latest release in `~/.local/bin`. Run `cputune install` again
-to update. Only one copy stays installed: if `/usr/local/bin/cputune` exists,
-`install` updates that one, and `install --system` deletes the copy in
-`~/.local/bin`.
+> [!TIP]
+> One Python file (3.9 or newer), no dependencies. It goes to `~/.local/bin`.
+> Run `cputune install` again to update.
 
 ## Use
 
 ```sh
-cputune                       # the cores, the settings, what can make results vary
-cputune -w                    # live view of the core frequencies
-cputune run -- ./bench        # lock the best core, run ./bench on it, then reset
-cputune run -c 2 -- ./bench   # the same on CPU 2, as taskset -c 2: same CPU every time
-cputune lock                  # lock the best core (without CPU 0) at base frequency
-cputune lock 3GHz -c 2        # lock CPU 2 and its SMT sibling at 3000 MHz
-cputune limit --max 2400      # all cores: at most 2400 MHz
-cputune reset                 # undo lock and limit
+cputune                      # the cores (best first), the settings, what can make results vary
+cputune -w                   # live view of the core frequencies
+cputune run -- ./bench       # lock the best core, run ./bench on it, reset
 ```
 
-`lock` turns boost off, sets the `performance` governor, and sets the minimum
-and maximum frequency to the same value. Then it measures the frequency under
-load. Some CPUs stay a little below the lock (Ryzen 9 7950X: 4304 MHz for 4501).
-`reset` restores the settings from before. A reboot also restores them.
+| Command | What it does |
+| --- | --- |
+| `cputune run -c 2 -- ./bench` | The same as `run`, but always on CPU 2 (as `taskset -c 2`) |
+| `cputune run --strict -- ./bench` | Run `./bench` only when the lock holds |
+| `cputune lock` | Lock the best core (not CPU 0) at base frequency, boost off |
+| `cputune lock 3GHz -c 2` | Lock CPU 2 and its SMT sibling at 3000 MHz |
+| `cputune limit --max 2400` | All cores: at most 2400 MHz |
+| `cputune reset` | Undo `lock` and `limit` (a reboot also does) |
 
-`run` is the easiest way to get stable results: it locks, runs the command as
-your user, and always resets, also after Ctrl+C. Without `-c`, it picks the
-best-ranked core. With `-c`, the command runs on exactly these CPUs, so results
-stay comparable between runs. `lock` and `run` always lock the whole core: SMT
-siblings share one frequency.
+`cputune --help` shows all commands, `cputune <command> --help` all options. Every command takes `--json`.
 
-`run` also checks the load on the machine, and measures the frequency while
-the command runs. It warns when something can make the result vary: other
-load, battery power, a hot CPU that runs slower, or settings that another
-program (such as `tuned`) changed. With `--strict`, the command does not run
-when the lock does not hold, for example when the core runs faster than the lock.
+### How `run` works
 
-`cputune --help` shows the commands, grouped by task. `cputune <command> --help`
-shows all options. All commands accept `--json`.
+```mermaid
+flowchart LR
+    A["<b>lock</b><br>boost off<br>min = max frequency"] --> B["<b>measure</b><br>frequency under load"]
+    B --> C["<b>run</b><br>as your user,<br>pinned to the core"]
+    C --> D["<b>reset</b><br>also after Ctrl+C"]
+    D --> E["<b>warn</b><br>other load, battery,<br>heat, changed settings"]
+```
 
-## Use without a password prompt
+> [!IMPORTANT]
+> To compare runs, use the same CPU every time: `cputune run -c 2 -- ./bench`.
+> The best-ranked core can change between runs.
 
-`lock`, `run`, `limit` and `reset` need root, and they run `sudo` themselves.
-Scripts and AI agents have no terminal to type a password. To allow `cputune`
-without a password, run this once:
+> [!NOTE]
+> Some CPUs run a little below the lock. A Ryzen 9 7950X locked at 4501 MHz runs at 4304 MHz.
+> `cputune` measures the real frequency and shows it.
+
+## Use without a password
+
+`lock`, `run`, `limit` and `reset` need root, and run `sudo` themselves. Scripts and AI agents
+cannot type a password. Run this once:
 
 ```sh
 cputune install --no-password
 ```
 
-It installs `cputune` in `/usr/local/bin`, owned by root, and adds a sudo rule
-for that copy. Root always runs this copy, also when you start another one, for
-example in `~/.local/bin`. `cputune install` updates it. Under sudo, `cputune`
-only runs `lock`, `limit`, `reset` and `update`, so the rule gives no more than
-the CPU settings. Undo: `sudo rm /etc/sudoers.d/cputune`.
+> [!WARNING]
+> This installs a root-owned copy in `/usr/local/bin` and adds a sudo rule for it. Under sudo,
+> `cputune` only runs `lock`, `limit`, `reset` and `update`. Undo: `sudo rm /etc/sudoers.d/cputune`.
 
-## Use from AI agents
-
-Copy this into the instructions of your agent, for example `AGENTS.md` or `CLAUDE.md`:
+<details>
+<summary><b>Instructions for AI agents</b> (copy into <code>AGENTS.md</code> or <code>CLAUDE.md</code>)</summary>
 
 ```markdown
 For benchmarks, use `cputune run -- <command>`. It locks a fast core at a fixed
@@ -80,17 +92,34 @@ and the `warnings`. If `cputune` says that sudo needs a password, stop and ask
 the user to run `cputune install --no-password`.
 ```
 
-## Development
+</details>
+
+<details>
+<summary><b>Tested machines</b></summary>
+
+The tests use recorded sysfs data from these machines, see [tests/machines](tests/machines).
+
+| CPU | Frequency driver |
+| --- | --- |
+| AMD Ryzen 9 7950X, Ryzen 5 5500GT, Ryzen AI 7 350 | `amd-pstate-epp` |
+| AMD EPYC 9354P | `acpi-cpufreq` |
+| Intel Core i9-13950HX (P- and E-cores) | `intel_pstate` |
+| Raspberry Pi 4 | `cpufreq-dt` |
+
+</details>
+
+<details>
+<summary><b>Development</b></summary>
 
 ```sh
 python3 tests/run.py                  # all tests, in parallel (a few seconds)
 python3 tests/hardware_check.py       # lock, limit, reset and run on this machine (uses sudo)
 ```
 
-The tests run against fake sysfs trees, built from the recorded machines in
-[tests/machines](tests/machines). Increase `__version__` for every change to
-`cputune`. After a merge to `main`, CI creates the tag and the
-[GitHub release](https://github.com/martinus/cputune/releases).
+Increase `__version__` for every change to `cputune`. After a merge to `main`, CI creates the tag
+and the [GitHub release](https://github.com/martinus/cputune/releases).
+
+</details>
 
 ## License
 
