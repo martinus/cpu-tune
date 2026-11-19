@@ -108,6 +108,8 @@ def build(root: Path, name: str) -> Machine:
                 w(f / "energy_performance_preference", "balance_performance")
             if m.driver.startswith("amd-pstate"):
                 w(f / "boost", 1)  # per-core switch, as on kernel 6.11 and newer
+                # lowest_nonlinear_perf 85, nominal_perf 127, as on the Ryzen 9 7950X
+                w(f / "amd_pstate_lowest_nonlinear_freq", base * 1000 * 85 // 127)
             if m.driver == "acpi-cpufreq":
                 w(f / "scaling_available_frequencies", f"{base * 1000} 2200000 {min_mhz * 1000}")
     if m.driver == "intel_pstate":

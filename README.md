@@ -33,7 +33,8 @@ cputune reset                 # undo lock and limit
 
 `lock` turns boost off, sets the `performance` governor, and sets the minimum
 and maximum frequency to the same value. Then it measures the frequency under
-load. `reset` restores the settings from before. A reboot also restores them.
+load. Some CPUs stay a little below the lock (Ryzen 9 7950X: 4304 MHz for 4501).
+`reset` restores the settings from before. A reboot also restores them.
 
 `run` is the easiest way to get stable results: it locks, runs the command as
 your user, and always resets, also after Ctrl+C. Without `-c`, it picks the
@@ -43,9 +44,9 @@ siblings share one frequency.
 
 `run` also checks the machine (as `check` does) and measures the frequency
 while the command runs. It warns when something can make the result vary: other
-load, a power service such as `power-profiles-daemon`, battery power, a hot CPU
-that runs slower, or settings that another program changed. With `--strict`,
-the command does not run when the measured frequency is not the lock.
+load, battery power, a hot CPU that runs slower, or settings that another
+program (such as `tuned`) changed. With `--strict`, the command does not run
+when the lock does not hold, for example when the core runs faster than the lock.
 
 `cputune --help` and `cputune <command> --help` show all options. All commands
 accept `--json`.

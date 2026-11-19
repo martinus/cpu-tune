@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
-__version__ = "2.3.0"  # increase it for every change: "cputune update" compares versions
+__version__ = "2.3.1"  # increase it for every change: "cputune update" compares versions
 
 # The latest release, not main: raw.githubusercontent.com caches main for 5 minutes, and a
 # release exists only after the tests passed on main.
@@ -77,7 +77,8 @@ examples:
 
 FREQ is a number in MHz (2400), a value with a unit (2400MHz, 2.4GHz), or one
 of the words base, min, max. CPUS is a list such as 3, 2,3, 0-7 or all. lock,
-run and limit always include the SMT siblings of each CPU.
+run and limit always include the SMT siblings of each CPU. With amd-pstate,
+lock min is amd_pstate_lowest_nonlinear_freq: the CPU does not go lower.
 
 run executes COMMAND as your user, pinned to CPUS (as taskset -c CPUS; without
 --cpu: all CPUs of the locked core), and always resets at the end. Its own
@@ -928,11 +929,11 @@ def run_checks(cpus: list[int], seconds: float = 0.5) -> list[dict]:
             add("warn", "machine load", f"The machine is {machine:.0%} busy. Programs on other cores share "
                 "caches, memory and the power limit with the benchmark.", "Stop other programs.")
 
-    services = running_services()
-    for service in services:
-        add("warn", "service", f"{service} runs. It can change boost, EPP or the governor while a benchmark "
-            "runs.", f"Stop it until the next reboot: sudo systemctl stop {service}")
-    if not services:
+    if services := running_services():
+        names = " ".join(services)
+        add("note", "service", f"{', '.join(services)} can change boost, EPP or the governor. cputune run "
+            "warns when this happens while a command runs.", f"Stop until the next reboot: sudo systemctl stop {names}")
+    else:
         add("ok", "service", "No power service runs (power-profiles-daemon, tuned, auto-cpufreq).")
 
     online = []
@@ -1175,6 +1176,13 @@ def target_khz(cpu: int, freq: int | str, clamp: bool) -> int:
     return khz
 
 
+def lowest_lock_khz(cpu: int) -> int:
+    """The lowest frequency that a lock can hold. amd-pstate: the CPU does not follow a request
+    below lowest_nonlinear_freq (Ryzen 9 7950X: 425 MHz requested, 2170 MHz measured)."""
+    lowest = must_khz(cpu, "cpuinfo_min_freq")
+    return max(lowest, read_int(fdir(cpu) / "amd_pstate_lowest_nonlinear_freq") or 0)
+
+
 def cmd_lock(args: argparse.Namespace) -> None:
     freq = args.freq if args.freq is not None else "base"
     ensure_root(args)
@@ -1205,7 +1213,7 @@ def cmd_lock(args: argparse.Namespace) -> None:
     targets = {}
     for cpu in cpus:
         try:
-            targets[cpu] = target_khz(cpu, freq, clamp=False)
+            targets[cpu] = lowest_lock_khz(cpu) if freq == "min" else target_khz(cpu, freq, clamp=False)
         except Error as e:
             die(f"{e} Boost is off now. Undo with: cputune reset")
 
@@ -1227,10 +1235,16 @@ def cmd_lock(args: argparse.Namespace) -> None:
         cpu = siblings[0]
         want = targets[cpu] // 1000
         got = now.get(cpu, 0)
-        ok = bool(got) and abs(got - want) <= max(50, want * 0.03)
+        # The CPU firmware can run a core a little below the lock (Ryzen 9 7950X: 4304 MHz for 4501,
+        # 2729 for 3000), but always at the same frequency. That is stable, so it is no problem.
+        # Faster than the lock: boost is still on, or the CPU does not go this low.
+        ok = bool(got) and got <= want + max(50, want * 0.03)
         cores.append({"cpus": siblings, "target_mhz": want, "measured_mhz": got or None, "ok": ok})
-        if not ok:
-            warn(f"cpu{cpu}: measured {got} MHz under load, but the lock is {want} MHz")
+        if not got:
+            warn(f"cpu{cpu}: cannot measure the frequency under load")
+        elif not ok:
+            warn(f"cpu{cpu}: measured {got} MHz under load, faster than the lock {want} MHz. "
+                 "Boost is still on, or the CPU does not go this low.")
 
     # A benchmark runs on the CPUs that the user named, as with taskset. The lock covers the
     # whole physical core, because SMT siblings share one frequency. Without --cpu: all of it.
@@ -1258,6 +1272,7 @@ def cmd_lock(args: argparse.Namespace) -> None:
             + paint(f"{core['target_mhz']} MHz", BOLD, MAGENTA)
             + paint(f"   measured under load: {core['measured_mhz'] or '?'} MHz ", GRAY)
             + mark
+            + below_note(core)
         )
     boost_text = {
         "core": f"off for cpu {format_cpu_list(cpus)} only",
@@ -1269,6 +1284,14 @@ def cmd_lock(args: argparse.Namespace) -> None:
     say()
     say(f"Run a benchmark:  {paint(taskset + ' ./bench', BOLD, WHITE)}")
     say(f"Undo:             {paint('cputune reset', BOLD, WHITE)}")
+
+
+def below_note(core: dict) -> str:
+    """A note when the core runs clearly below the lock: the CPU firmware sets this frequency."""
+    want, got = core["target_mhz"], core["measured_mhz"]
+    if not got or got >= want - max(50, want * 0.03):
+        return ""
+    return paint(f" ({(want - got) / want:.0%} below the lock: the CPU firmware sets this frequency)", GRAY)
 
 
 def cmd_limit(args: argparse.Namespace) -> None:
@@ -1433,7 +1456,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     unverified = [c for c in cores if not c["ok"]]
     for core in unverified:
         problems.append(f"cpu {format_cpu_list(core['cpus'])}: measured {core['measured_mhz'] or '?'} MHz "
-                        f"under load, but the lock is {core['target_mhz']} MHz")  # lock warned already
+                        f"under load, faster than the lock {core['target_mhz']} MHz")  # lock warned already
     if args.strict and unverified:
         reset()
         die(f"the lock is not verified: {'; '.join(problems[-len(unverified):])}. "
@@ -1502,7 +1525,9 @@ def cmd_run(args: argparse.Namespace) -> None:
             core["run_min_mhz"] = min(values) if values else None
             after = throttle_count(core["cpus"][0])
             core["throttled"] = after - before if after is not None and before is not None else None
-            where, want, avg = format_cpu_list(core["cpus"]), core["target_mhz"], core["run_avg_mhz"]
+            # Compare with the frequency that lock measured: the firmware can hold a lock below the target.
+            where, avg = format_cpu_list(core["cpus"]), core["run_avg_mhz"]
+            want = min(core["measured_mhz"] or core["target_mhz"], core["target_mhz"])
             if not args.json:
                 text = f"cpu {where} ran at {avg or '?'} MHz (lowest {core['run_min_mhz'] or '?'} MHz)"
                 if core["throttled"] == 0:
@@ -1510,8 +1535,8 @@ def cmd_run(args: argparse.Namespace) -> None:
                 say(paint("cputune: ", GRAY) + text)
             if avg is not None and abs(avg - want) > max(50, want * 0.03):
                 why = "too hot, or at its power limit" if avg < want else "did another program change the lock?"
-                problem(f"cpu {where} ran at {avg} MHz on average while the command ran, but the lock is "
-                        f"{want} MHz ({why})")
+                problem(f"cpu {where} ran at {avg} MHz on average while the command ran, but at {want} MHz "
+                        f"after the lock ({why})")
             if core["throttled"]:
                 problem(f"cpu {where} was too hot and ran slower {core['throttled']} times while the command ran")
     finally:

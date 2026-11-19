@@ -48,7 +48,11 @@ shellcheck examples/*.sh
 ## This machine
 
 - Ryzen 9 7950X, `amd-pstate-epp`, kernel 7.x: no `amd_pstate_nominal_freq`; base frequency comes
-  from `acpi_cppc/nominal_freq` (MHz). `cpuinfo_avg_freq` exists.
+  from `acpi_cppc/nominal_freq` (MHz). `cpuinfo_avg_freq` exists. Measured with `lock -c 4`
+  (2.3.0): 3000 -> 2729 MHz, 4000 -> 3601, 4501 -> 4304, 425 (min) -> 2170. The same within 0.5 %
+  each time, with and without `tuned`. TSC 4499.7 MHz, CPPC linear (35.44 MHz per perf), so the
+  measurement is right: the firmware runs below the request and not below about 2170 MHz.
+  `amd_pstate_lowest_nonlinear_freq` is 3012 MHz. `tuned` and `tuned-ppd` run (profile balanced).
 - sudo needs a password, so agents cannot run `lock`, `limit`, `reset`, `run` or
   `sudoers --install` for real: give Martin the command to run.
 - Fedora sudo: `env_reset`, `always_set_home`.

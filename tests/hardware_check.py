@@ -63,10 +63,12 @@ def same_as(before: dict[str, str], name: str) -> None:
 
 
 def locked_ok(data: dict) -> bool:
-    """Each locked CPU has minimum = maximum = target, and the measured frequency matches."""
+    """Each locked CPU has minimum = maximum = target, and cputune accepts the measured frequency."""
     for core in data.get("cores", []):
+        print(f"      cpu {core['cpus']}: lock {core['target_mhz']} MHz, measured {core['measured_mhz']} MHz")
         for cpu in core["cpus"]:
-            if not read(cpu, "scaling_min_freq") == read(cpu, "scaling_max_freq") == str(core["target_mhz"] * 1000):
+            low, high = read(cpu, "scaling_min_freq"), read(cpu, "scaling_max_freq")
+            if low != high or int(low) // 1000 != core["target_mhz"]:
                 return False
     return bool(data.get("cores")) and all(core["ok"] for core in data["cores"])
 
