@@ -235,8 +235,28 @@ class ShowTest(Case):
         self.assertIn("cputune install --no-password", text)
         self.assertTrue(self.ok("install", "--help").stdout.startswith("usage: cputune install "))
 
+    def test_help_colors_follow_argparse(self) -> None:
+        # Python 3.14 colors its help (FORCE_COLOR: also without a terminal). HELP takes the same colors.
+        text = self.run_tool("--help", FORCE_COLOR="1").stdout  # run_tool removes NO_COLOR
+        if sys.version_info < (3, 14):
+            self.assertNotIn("\033[", text)  # argparse has no colors: HELP neither
+            return
+        heading, prog, extra = "\033[1;34m", "\033[1;35m", "\033[35m"
+        self.assertIn(f"{heading}run a benchmark:\033[0m", text)
+        self.assertIn(f"{heading}options:\033[0m", text)  # the same color from argparse itself
+        self.assertIn(f"  {prog}cputune\033[0m {extra}run\033[0m \033[36m--strict\033[0m -- ./b   run ./b", text)
+        self.assertIn(f"  {prog}cputune\033[0m {extra}lock\033[0m 3GHz \033[32m-c\033[0m 2        lock CPU 2", text)
+        self.assertIn("  \033[1;33mFREQ\033[0m ", text)
+        self.assertIn("  run executes COMMAND as your user", text)  # plain text stays plain
+        self.assertNotIn("\033[", self.run_tool("--help", FORCE_COLOR="1", NO_COLOR="1").stdout)
 
-class LockTest(Case):
+    def test_help_names_all_options(self) -> None:
+        text = self.ok("--help").stdout
+        for command in ("show", "run", "lock", "limit", "reset", "install"):
+            options = set(re.findall(r"(?<![\w-])--[a-z][a-z-]*", self.ok(command, "--help").stdout))
+            for option in options:
+                self.assertIn(option, text, command)
+
     def test_lock_default_intel(self) -> None:
         before = self.snapshot()
         data = self.json("lock")

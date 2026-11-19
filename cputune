@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
-__version__ = "2.4.0"  # increase it for every change: "cputune update" compares versions
+__version__ = "2.4.1"  # increase it for every change: "cputune update" compares versions
 
 # The latest release, not main: raw.githubusercontent.com caches main for 5 minutes, and a
 # release exists only after the tests passed on main.
@@ -64,6 +64,8 @@ look at the machine:
   cputune                       the cores (best first), the settings, and what
                                 can make benchmark results vary
   cputune -w                    live view of the core frequencies
+  cputune -w --interval 0.5     the same, with an update every 0.5 s (default: 1)
+  cputune -w --count 10         the same, and stop after 10 updates
   cputune --now                 also measure the current frequency (1 s)
 
 run a benchmark:
@@ -74,30 +76,40 @@ run a benchmark:
 change settings by hand:
   cputune lock                  lock the best core at base frequency, boost off
   cputune lock 3GHz -c 2        lock CPU 2 and its SMT sibling at 3000 MHz
+  cputune lock --exclusive      lock, but fail when cputune changed settings
   cputune limit --max 2400      all cores: at most 2400 MHz
+  cputune limit --min 2000      all cores: at least 2000 MHz
   cputune reset                 undo lock and limit (a reboot also does)
 
 install and update:
   cputune install               install the newest release, or update to it
   cputune install --system      the same, in /usr/local/bin, owned by root
-  cputune install --no-password lock, run, limit and reset without a password:
+  cputune install --no-check    install this file, do not look on GitHub
+  cputune install --no-password
+                                lock, run, limit and reset without a password:
                                 for scripts and AI agents (adds a sudo rule)
 
-FREQ is a number in MHz (2400), a value with a unit (2400MHz, 2.4GHz), or one
-of the words base, min, max. CPUS is a list such as 3, 2,3, 0-7 or all. lock,
-run and limit always include the SMT siblings of each CPU. With amd-pstate,
-lock min is amd_pstate_lowest_nonlinear_freq: the CPU does not go lower.
+values:
+  FREQ                          MHz (2400), with a unit (2400MHz, 2.4GHz), or
+                                base, min, max. With amd-pstate, lock min is
+                                amd_pstate_lowest_nonlinear_freq: the CPU does
+                                not go lower.
+  CPUS                          a list such as 3, 2,3, 0-7 or all. lock, run
+                                and limit always add the SMT siblings.
 
-run executes COMMAND as your user, pinned to CPUS (as taskset -c CPUS; without
---cpu: all CPUs of the locked core), and always resets at the end. Its own
-messages go to stderr; stdout and the exit code are the ones of COMMAND. run
-measures the frequency while COMMAND runs, and warns when the result can vary;
-then its JSON has "stable": false.
+how run and sudo work:
+  run executes COMMAND as your user, pinned to CPUS (as taskset -c CPUS), and
+  always resets at the end. Its own messages go to stderr; stdout and the exit
+  code are the ones of COMMAND. It measures the frequency while COMMAND runs,
+  and warns when the result can vary: then its JSON has "stable": false.
 
-lock, run, limit and reset need root. They run sudo themselves: do not start
-cputune with sudo. Without a terminal (for example in scripts and AI agents)
-they use "sudo -n" and never ask for a password. Add --json to any command for
-machine-readable output. "cputune COMMAND --help" shows all options of a command.
+  lock, run, limit and reset need root, and they run sudo themselves: do not
+  start them with sudo. Without a terminal (scripts, AI agents) they use
+  "sudo -n" and never ask for a password.
+
+  Each command takes --json (machine-readable output), --color {auto,always,never}
+  and --help (all options of the command). Short forms: -w is --watch, -c is
+  --cpu, -h is --help.
 """
 
 
@@ -1999,6 +2011,44 @@ def update_root_copy(path: Path, newest: str | None, quiet: bool) -> dict | None
 # ------------------------------------------------------------------ main
 
 
+def color_help(text: str, theme) -> str:
+    """HELP in the colors of the argparse theme: the headers as "options:", the commands as in
+    "usage:", FREQ and CPUS as the labels in the option list. The plain text stays plain."""
+    def options(part: str) -> str:  # as argparse colors the usage line
+        part = re.sub(r"(?<![\w-])(--?[a-z][a-z-]*)", lambda m: (
+            theme.summary_long_option if m[1].startswith("--") else theme.summary_short_option
+        ) + m[1] + theme.reset, part)
+        part = re.sub(r"(?<![\w-])([A-Z]+)(?![\w-])", lambda m: theme.summary_label + m[1] + theme.reset, part)
+        return re.sub(r"\{[^}]*\}", lambda m: theme.summary_label + m[0] + theme.reset, part)
+
+    lines, section = [], ""
+    for line in text.split("\n"):
+        if re.fullmatch(r"[a-z][a-z ]*:", line):
+            section = line
+            line = theme.heading + line + theme.reset
+        elif line.startswith("  cputune"):  # a command, then (after two spaces) what it does
+            end = line.find("  ", 2)
+            command, rest = (line[2:end], line[end:]) if end > 0 else (line[2:], "")
+            prog, _, args = command.partition(" ")
+            name, _, args = args.partition(" ") if args[:1].isalpha() or args.startswith("[show]") else ("", "", args)
+            name = " " + theme.prog_extra + name + theme.reset if name else ""
+            line = "  " + theme.prog + prog + theme.reset + name + (" " + options(args) if args else "") + rest
+        elif section == "values:" and (m := re.match(r"  ([A-Z]+)( .*)", line)):
+            line = "  " + theme.label + m[1] + theme.reset + m[2]
+        lines.append(line)
+    return "\n".join(lines)
+
+
+class HelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """HELP in the colors of argparse. argparse decides: Python 3.14 and newer, in a terminal,
+    without NO_COLOR. Else no colors, also in HELP."""
+
+    def _format_text(self, text: str) -> str:
+        text = super()._format_text(text)
+        theme = getattr(self, "_theme", None)  # set by argparse 3.14 and newer
+        return color_help(text, theme) if theme is not None and theme.reset else text
+
+
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
@@ -2008,7 +2058,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="cputune", usage="cputune [COMMAND] [OPTIONS]", description=HELP, parents=[common],
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=HelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"cputune {__version__}")
     sub = parser.add_subparsers(prog="cputune", help=argparse.SUPPRESS)  # HELP groups the commands by task
