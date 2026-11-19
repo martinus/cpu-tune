@@ -1,7 +1,7 @@
-"""Tests for cpu-tune. Run: python3 -m unittest discover -s tests
+"""Tests for cputune. Run: python3 -m unittest discover -s tests
 
 Each test builds a fake sysfs tree from a recorded machine (tests/machines/)
-and runs the real script against it with CPU_TUNE_ROOT. Then cpu-tune does not
+and runs the real script against it with CPUTUNE_ROOT. Then cputune does not
 call sudo, and it does not put load on the real CPUs.
 """
 
@@ -27,7 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 import fake_sysfs  # noqa: E402
 
-SCRIPT = Path(__file__).resolve().parent.parent / "cpu-tune"
+SCRIPT = Path(__file__).resolve().parent.parent / "cputune"
 
 
 def fake_sysfs_cpus(text: str) -> list[int]:
@@ -42,15 +42,15 @@ class Case(unittest.TestCase):
     machine = "intel-i9-13950hx"
 
     def setUp(self) -> None:
-        self.root = Path(tempfile.mkdtemp(prefix="cpu-tune-test-"))
+        self.root = Path(tempfile.mkdtemp(prefix="cputune-test-"))
         self.addCleanup(shutil.rmtree, self.root)
         fake_sysfs.build(self.root, self.machine)
         self.cpu = self.root / "sys/devices/system/cpu"
-        self.state = self.root / "run/cpu-tune.json"
+        self.state = self.root / "run/cputune.json"
 
     def run_tool(self, *args: str, columns: int = 100, script: Path = SCRIPT, **env_vars: str):
         env = {k: v for k, v in os.environ.items() if k not in ("NO_COLOR", "COLUMNS")}
-        env.update(CPU_TUNE_ROOT=str(self.root), COLUMNS=str(columns), **env_vars)
+        env.update(CPUTUNE_ROOT=str(self.root), COLUMNS=str(columns), **env_vars)
         return subprocess.run(
             [sys.executable, str(script), *args], env=env, capture_output=True, text=True, timeout=60
         )
@@ -96,7 +96,7 @@ class ShowTest(Case):
                 ranks = [c["rank"] for c in data["cores"]]
                 self.assertEqual(ranks, sorted(ranks, reverse=True))
                 self.assertNotIn(0, data["default_lock_cpus"])
-                self.assertIsNone(data["changed_by_cpu_tune"])
+                self.assertIsNone(data["changed_by_cputune"])
                 for color in ("always", "never"):
                     text = self.ok("show", "--color", color).stdout
                     self.assertIn(machine.model, text)
@@ -164,7 +164,7 @@ class ShowTest(Case):
 
     def test_watch_reads_changes_and_stays_away(self) -> None:
         self.ok("lock")  # cpu 8,9
-        env = {k: v for k, v in os.environ.items() if k != "NO_COLOR"} | {"CPU_TUNE_ROOT": str(self.root)}
+        env = {k: v for k, v in os.environ.items() if k != "NO_COLOR"} | {"CPUTUNE_ROOT": str(self.root)}
         proc = subprocess.Popen(
             [sys.executable, str(SCRIPT), "watch", "--json", "--interval", "0.2", "--count", "30"],
             env=env, stdout=subprocess.PIPE, text=True,
@@ -219,9 +219,9 @@ class LockTest(Case):
         self.assertEqual(state["cpus"]["8"]["governor"], "powersave")
         self.assertEqual(state["boost"], {str(self.cpu / "intel_pstate/no_turbo"): "0"})
         shown = self.json("show")
-        self.assertEqual(shown["changed_by_cpu_tune"]["cpus"], [8, 9])
+        self.assertEqual(shown["changed_by_cputune"]["cpus"], [8, 9])
         self.assertTrue(next(c for c in shown["cores"] if c["cpus"] == [8, 9])["locked"])
-        self.assertIn("cpu-tune reset", self.ok("show").stdout)
+        self.assertIn("cputune reset", self.ok("show").stdout)
 
     def test_second_lock_keeps_originals(self) -> None:
         self.ok("lock")
@@ -261,7 +261,7 @@ class LockTest(Case):
 
     def test_exclusive(self) -> None:
         self.ok("lock")
-        self.assertIn("cpu-tune reset", self.fails("lock", "--exclusive", "--cpu", "2").stderr)
+        self.assertIn("cputune reset", self.fails("lock", "--exclusive", "--cpu", "2").stderr)
         self.assertNotIn("2", json.loads(self.state.read_text())["cpus"])
 
     def test_json_error(self) -> None:
@@ -366,7 +366,7 @@ class ResetTest(Case):
         self.assertTrue(data["restored"])
         self.assertEqual(self.snapshot(), before)
         self.assertFalse(self.state.exists())
-        self.assertIsNone(self.json("show")["changed_by_cpu_tune"])
+        self.assertIsNone(self.json("show")["changed_by_cputune"])
 
     def test_restores_per_core_boost(self) -> None:
         shutil.rmtree(self.root)
@@ -405,15 +405,15 @@ class ResetTest(Case):
 
     def test_damaged_state(self) -> None:
         self.state.write_text("{not json")
-        self.assertIn("sudo rm /run/cpu-tune.json", self.fails("reset").stderr)
+        self.assertIn("sudo rm /run/cputune.json", self.fails("reset").stderr)
 
 
 class RunTest(Case):
     def test_runs_pinned_and_resets(self) -> None:
         before = self.snapshot()
-        code = "import os; print(os.environ['CPU_TUNE_CPUS'])"
+        code = "import os; print(os.environ['CPUTUNE_CPUS'])"
         result = self.ok("run", "--cpu", "4", "--", sys.executable, "-c", code)
-        self.assertEqual(result.stdout, "4,5\n")  # cpu-tune messages go to stderr
+        self.assertEqual(result.stdout, "4,5\n")  # cputune messages go to stderr
         self.assertIn("locked cpu 4,5 at 2200 MHz", result.stderr)
         self.assertIn("reset done", result.stderr)
         self.assertEqual(self.snapshot(), before)
@@ -431,7 +431,7 @@ class RunTest(Case):
         self.ok("lock")
         marker = self.root / "ran"
         result = self.fails("run", "--", sys.executable, "-c", f"open({str(marker)!r}, 'w')")
-        self.assertIn("cpu-tune reset", result.stderr)
+        self.assertIn("cputune reset", result.stderr)
         self.assertFalse(marker.exists())
         self.assertTrue(self.state.exists())  # the earlier lock stays
 
@@ -455,7 +455,7 @@ class RunTest(Case):
 
 
 def with_version(version: str) -> bytes:
-    """The cpu-tune script with another __version__."""
+    """The cputune script with another __version__."""
     source = SCRIPT.read_bytes()
     current = re.search(rb'^__version__ = "[^"]+"', source, re.M)[0]
     return source.replace(current, f'__version__ = "{version}"'.encode(), 1)
@@ -464,23 +464,23 @@ def with_version(version: str) -> bytes:
 class InstallTest(Case):
     def setUp(self) -> None:
         super().setUp()
-        self.remote = self.root / "remote/cpu-tune"  # stands in for GitHub
+        self.remote = self.root / "remote/cputune"  # stands in for GitHub
         self.remote.parent.mkdir()
         self.url = self.remote.as_uri()
-        self.copy = self.root / "bin/cpu-tune"  # an installed copy, not in a git checkout
+        self.copy = self.root / "bin/cputune"  # an installed copy, not in a git checkout
         self.copy.parent.mkdir()
         self.copy.write_bytes(SCRIPT.read_bytes())
 
     def install(self, *args: str) -> dict:
-        result = self.run_tool("install", "--json", *args, CPU_TUNE_SOURCE_URL=self.url)
+        result = self.run_tool("install", "--json", *args, CPUTUNE_SOURCE_URL=self.url)
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
     def update(self, script: Path | None = None) -> subprocess.CompletedProcess:
-        return self.run_tool("update", "--json", script=script or self.copy, CPU_TUNE_SOURCE_URL=self.url)
+        return self.run_tool("update", "--json", script=script or self.copy, CPUTUNE_SOURCE_URL=self.url)
 
     def test_install_takes_the_newer_version(self) -> None:
-        target = self.root / "home/.local/bin/cpu-tune"
+        target = self.root / "home/.local/bin/cputune"
         self.remote.write_bytes(with_version("0.0.1"))
         self.assertEqual(self.install()["source"], "this file")
         self.assertEqual(target.read_bytes(), SCRIPT.read_bytes())
@@ -492,20 +492,29 @@ class InstallTest(Case):
         self.assertEqual(self.install("--no-check")["source"], "this file")
         self.assertEqual(target.read_bytes(), SCRIPT.read_bytes())
 
+    def test_warns_about_copies_with_the_old_name(self) -> None:
+        self.remote.write_bytes(with_version("0.0.1"))
+        self.assertNotIn("warnings", self.install())
+        old = self.root / "usr/local/bin/cpu-tune"
+        old.parent.mkdir(parents=True)
+        old.write_text("old")
+        for data in (self.install(), self.json("sudoers")):
+            self.assertIn(f"sudo rm -f {old} /etc/sudoers.d/cpu-tune", data["warnings"][0])
+
     def test_install_system_and_offline(self) -> None:
         data = self.install("--system")  # no remote file: the download fails
-        self.assertEqual(data["path"], str(self.root / "usr/local/bin/cpu-tune"))
+        self.assertEqual(data["path"], str(self.root / "usr/local/bin/cputune"))
         self.assertIn("cannot download", data["warnings"][0])
-        self.assertEqual((self.root / "usr/local/bin/cpu-tune").read_bytes(), SCRIPT.read_bytes())
+        self.assertEqual((self.root / "usr/local/bin/cputune").read_bytes(), SCRIPT.read_bytes())
 
     def test_install_from_stdin_downloads(self) -> None:
         self.remote.write_bytes(with_version("99.0.0"))
         env = {k: v for k, v in os.environ.items()} | {
-            "CPU_TUNE_ROOT": str(self.root), "CPU_TUNE_SOURCE_URL": self.url}
+            "CPUTUNE_ROOT": str(self.root), "CPUTUNE_SOURCE_URL": self.url}
         result = subprocess.run([sys.executable, "-", "install"], input=SCRIPT.read_bytes(), env=env,
                                 capture_output=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((self.root / "home/.local/bin/cpu-tune").read_bytes(), with_version("99.0.0"))
+        self.assertEqual((self.root / "home/.local/bin/cputune").read_bytes(), with_version("99.0.0"))
 
     def test_update(self) -> None:
         self.remote.write_bytes(SCRIPT.read_bytes())
@@ -522,7 +531,7 @@ class InstallTest(Case):
         self.assertEqual(self.copy.read_bytes(), with_version("99.0.0"))
 
     def test_update_through_symlink(self) -> None:
-        link = self.root / "link/cpu-tune"
+        link = self.root / "link/cputune"
         link.parent.mkdir()
         link.symlink_to(self.copy)
         self.remote.write_bytes(with_version("99.0.0"))
@@ -537,10 +546,10 @@ class InstallTest(Case):
                 self.remote.write_bytes(content)
                 result = self.update()
                 self.assertEqual(result.returncode, 1)
-                self.assertIn("not a cpu-tune script" if name == "html" else "does not compile",
+                self.assertIn("not a cputune script" if name == "html" else "does not compile",
                               json.loads(result.stdout)["error"])
                 self.assertEqual(self.copy.read_bytes(), SCRIPT.read_bytes())
-        self.assertEqual(sorted(p.name for p in self.copy.parent.iterdir()), ["cpu-tune"])  # no temp files
+        self.assertEqual(sorted(p.name for p in self.copy.parent.iterdir()), ["cputune"])  # no temp files
 
     def test_update_refuses_git_checkout(self) -> None:
         self.remote.write_bytes(with_version("99.0.0"))
@@ -549,7 +558,7 @@ class InstallTest(Case):
                 checkout = self.root / f"checkout-{kind}"
                 (checkout / "sub").mkdir(parents=True)
                 (checkout / ".git").mkdir() if kind == "dir" else (checkout / ".git").write_text("gitdir: x\n")
-                script = checkout / "sub/cpu-tune"
+                script = checkout / "sub/cputune"
                 script.write_bytes(SCRIPT.read_bytes())
                 result = self.update(script)
                 self.assertEqual(result.returncode, 1)
@@ -558,18 +567,18 @@ class InstallTest(Case):
 
     def test_version(self) -> None:
         version = re.search(r'^__version__ = "([^"]+)"', SCRIPT.read_text(), re.M)[1]
-        self.assertEqual(self.ok("--version").stdout.strip(), f"cpu-tune {version}")
+        self.assertEqual(self.ok("--version").stdout.strip(), f"cputune {version}")
         self.assertEqual(self.json("show")["version"], version)
 
 
 def load_module():
-    """cpu-tune as a module, to test functions that need states the tests cannot create.
+    """cputune as a module, to test functions that need states the tests cannot create.
 
     The module reads the environment when it loads: patch it before the call.
     """
-    loader = importlib.machinery.SourceFileLoader("cpu_tune", str(SCRIPT))
-    module = importlib.util.module_from_spec(importlib.util.spec_from_loader("cpu_tune", loader))
-    sys.modules["cpu_tune"] = module  # @dataclass looks the module up here
+    loader = importlib.machinery.SourceFileLoader("cputune", str(SCRIPT))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader("cputune", loader))
+    sys.modules["cputune"] = module  # @dataclass looks the module up here
     loader.exec_module(module)
     return module
 
@@ -577,7 +586,7 @@ def load_module():
 class SudoersTest(Case):
     def test_guide_when_nothing_is_set_up(self) -> None:
         # The test checkout is not owned by root, so the rule must name the system copy.
-        system_copy = self.root / "usr/local/bin/cpu-tune"
+        system_copy = self.root / "usr/local/bin/cputune"
         data = self.json("sudoers")
         self.assertEqual(data["path"], str(system_copy))
         self.assertFalse(data["installed"])
@@ -586,22 +595,22 @@ class SudoersTest(Case):
         self.assertTrue(data["setup"].endswith("sudoers --install"))
         text = self.ok("sudoers").stdout
         self.assertIn("Set it up with one command:", text)
-        self.assertIn(f"install cpu-tune to {system_copy}, owned by root", text)
-        self.assertIn("Undo: sudo rm /etc/sudoers.d/cpu-tune", text)
+        self.assertIn(f"install cputune to {system_copy}, owned by root", text)
+        self.assertIn("Undo: sudo rm /etc/sudoers.d/cputune", text)
 
     def test_install(self) -> None:
         offline = (self.root / "missing").as_uri()  # GitHub is not used in tests
-        result = self.run_tool("sudoers", "--install", "--json", CPU_TUNE_SOURCE_URL=offline)
+        result = self.run_tool("sudoers", "--install", "--json", CPUTUNE_SOURCE_URL=offline)
         self.assertEqual(result.returncode, 0, result.stderr)
         data = json.loads(result.stdout)
         self.assertEqual(len(data["done"]), 2)
-        system_copy = self.root / "usr/local/bin/cpu-tune"
+        system_copy = self.root / "usr/local/bin/cputune"
         self.assertEqual(system_copy.read_bytes(), SCRIPT.read_bytes())
         self.assertEqual(system_copy.stat().st_mode & 0o777, 0o755)
-        rule_file = self.root / "etc/sudoers.d/cpu-tune"
+        rule_file = self.root / "etc/sudoers.d/cputune"
         self.assertEqual(rule_file.stat().st_mode & 0o777, 0o440)
         lines = rule_file.read_text().splitlines()
-        self.assertTrue(lines[0].startswith("# /etc/sudoers.d/cpu-tune"))
+        self.assertTrue(lines[0].startswith("# /etc/sudoers.d/cputune"))
         self.assertEqual(lines[1], data["rule"])
         self.assertEqual(len(lines), 2)
 
@@ -609,19 +618,19 @@ class SudoersTest(Case):
         result = self.ok("sudoers", "--rule")
         lines = result.stdout.splitlines()
         self.assertEqual(len(lines), 2)
-        self.assertTrue(lines[0].startswith("# /etc/sudoers.d/cpu-tune"))
-        self.assertTrue(lines[1].endswith(f"NOPASSWD: {self.root / 'usr/local/bin/cpu-tune'}"))
+        self.assertTrue(lines[0].startswith("# /etc/sudoers.d/cputune"))
+        self.assertTrue(lines[1].endswith(f"NOPASSWD: {self.root / 'usr/local/bin/cputune'}"))
         self.assertIn("install --system", result.stderr)
 
     def test_guide_for_a_copy_owned_by_root(self) -> None:
         m = load_module()
-        status = {"user": "ann", "path": "/usr/local/bin/cpu-tune", "installed": True, "works": False,
-                  "rule": "ann ALL=(root) NOPASSWD: /usr/local/bin/cpu-tune", "file": "/etc/sudoers.d/cpu-tune",
-                  "setup": "cpu-tune sudoers --install", "undo": "sudo rm /etc/sudoers.d/cpu-tune"}
+        status = {"user": "ann", "path": "/usr/local/bin/cputune", "installed": True, "works": False,
+                  "rule": "ann ALL=(root) NOPASSWD: /usr/local/bin/cputune", "file": "/etc/sudoers.d/cputune",
+                  "setup": "cputune sudoers --install", "undo": "sudo rm /etc/sudoers.d/cputune"}
         text = "\n".join(m.render_sudoers(status))
-        self.assertIn("cpu-tune sudoers --install", text)
-        self.assertNotIn("install cpu-tune to", text)  # the copy is there already
-        self.assertIn("ann ALL=(root) NOPASSWD: /usr/local/bin/cpu-tune", text)
+        self.assertIn("cputune sudoers --install", text)
+        self.assertNotIn("install cputune to", text)  # the copy is there already
+        self.assertIn("ann ALL=(root) NOPASSWD: /usr/local/bin/cputune", text)
         text = "\n".join(m.render_sudoers(status | {"works": True}))
         self.assertIn("Everything is set up.", text)
         self.assertNotIn("sudoers --install", text)
@@ -639,11 +648,11 @@ class SudoersTest(Case):
 
 
 class SecurityTest(Case):
-    """A sudo rule lets every program of the user run cpu-tune as root. These tests make
+    """A sudo rule lets every program of the user run cputune as root. These tests make
     sure that this gives no more than the CPU settings."""
 
     def load_as_sudo_root(self):
-        env = {"SUDO_UID": "1000", "CPU_TUNE_ROOT": str(self.root), "CPU_TUNE_SOURCE_URL": "file:///evil"}
+        env = {"SUDO_UID": "1000", "CPUTUNE_ROOT": str(self.root), "CPUTUNE_SOURCE_URL": "file:///evil"}
         with mock.patch("os.geteuid", return_value=0), mock.patch.dict(os.environ, env):
             return load_module()
 
@@ -667,14 +676,14 @@ class SecurityTest(Case):
                          ["show"], ["watch"]):
                 with self.subTest(argv=argv):
                     stderr = io.StringIO()
-                    with mock.patch.object(sys, "argv", ["cpu-tune", *argv]), contextlib.redirect_stderr(stderr):
+                    with mock.patch.object(sys, "argv", ["cputune", *argv]), contextlib.redirect_stderr(stderr):
                         self.assertEqual(m.main(), 1)
                     self.assertIn("do not start", stderr.getvalue())
             self.assertEqual(called, [])
-            with mock.patch.object(sys, "argv", ["cpu-tune", "lock"]):
+            with mock.patch.object(sys, "argv", ["cputune", "lock"]):
                 self.assertEqual(m.main(), 0)
             self.assertEqual(called, ["lock"])
-        with mock.patch.object(sys, "argv", ["cpu-tune", "--version"]), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch.object(sys, "argv", ["cputune", "--version"]), contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaises(SystemExit) as exit:
                 m.main()
         self.assertEqual(exit.exception.code, 0)  # sudoers --install checks the rule with --version
@@ -722,11 +731,11 @@ class SecurityTest(Case):
         victim = self.root / "victim"
         victim.write_text("keep")
         for pid in range(4240, 4245):  # the names that a predictable temporary file would use
-            (folder / f".cpu-tune.{pid}.tmp").symlink_to(victim)
+            (folder / f".cputune.{pid}.tmp").symlink_to(victim)
         with mock.patch("os.getpid", return_value=4242):
-            m.replace_file(folder / "cpu-tune", b"new")
+            m.replace_file(folder / "cputune", b"new")
         self.assertEqual(victim.read_text(), "keep")
-        self.assertEqual((folder / "cpu-tune").read_bytes(), b"new")
+        self.assertEqual((folder / "cputune").read_bytes(), b"new")
 
 
 if __name__ == "__main__":
