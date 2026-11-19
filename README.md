@@ -98,7 +98,7 @@ always undoes the lock at the end.
 | `cpu-tune run [FREQ] [--cpu CPUS] -- COMMAND` | Locks, runs `COMMAND` on the locked cores, and resets. | Yes |
 | `cpu-tune limit [--min FREQ] [--max FREQ] [--cpu CPUS]` | Sets the frequency range of cores. | Yes |
 | `cpu-tune reset` | Undoes all changes of `lock`, `run` and `limit`. | Yes |
-| `cpu-tune sudoers [--rule]` | Shows how to run `cpu-tune` without a password prompt. `--rule` prints only the rule. | No |
+| `cpu-tune sudoers [--install]` | Shows or sets up the use without a password prompt. | With `--install` |
 | `cpu-tune install [--system]` | Installs to `~/.local/bin`, or to `/usr/local/bin` with `--system`. | With `--system` |
 | `cpu-tune update` | Updates this copy to the newest version on GitHub. | For a root-owned copy |
 | `cpu-tune --version` | Prints the version. | No |
@@ -288,37 +288,21 @@ what to do.
 To allow `cpu-tune` without a password, run:
 
 ```sh
-cpu-tune sudoers
+cpu-tune sudoers --install
 ```
 
-It shows what is already set up on your machine, and the steps that are still
-to do, with the exact commands. For example:
+It asks for your password once, and then:
+
+1. It installs `cpu-tune` in `/usr/local/bin`, owned by root, if it is not there yet.
+2. It checks the sudo rule with `visudo`, and installs it in `/etc/sudoers.d/cpu-tune`.
+3. It checks that sudo now runs `cpu-tune` without a password.
+
+`cpu-tune sudoers` without `--install` shows what is set up, and changes nothing.
+`cpu-tune sudoers --rule` prints only the rule. It looks like this:
 
 ```text
-  ✓ /usr/local/bin/cpu-tune is owned by root
-  ✗ sudo asks for a password
-
-Steps:
-  1. Write the rule, check it, and install it:
-       f=$(mktemp)
-       /usr/local/bin/cpu-tune sudoers --rule > "$f"
-       sudo visudo -cf "$f" && sudo install -m 440 -o root -g root "$f" /etc/sudoers.d/cpu-tune
-       rm "$f"
-  2. Check it. This must print the version, without a password prompt:
-       sudo -k -n /usr/local/bin/cpu-tune --version
-
-The rule in /etc/sudoers.d/cpu-tune:
-  martinus ALL=(root) NOPASSWD: /usr/local/bin/cpu-tune
+martinus ALL=(root) NOPASSWD: /usr/local/bin/cpu-tune
 ```
-
-These are all the steps:
-
-1. Install `cpu-tune` in a folder that only root can change: `cpu-tune install --system`.
-2. Write the rule with `cpu-tune sudoers --rule`, check it with `visudo -cf`, and
-   install it in `/etc/sudoers.d/cpu-tune`. A broken file in `/etc/sudoers.d` can
-   break sudo, so always check it first.
-3. Check that `sudo -k -n /usr/local/bin/cpu-tune --version` prints the version.
-   `-k` makes sudo ignore a password that it remembers, so only the rule counts.
 
 To undo it: `sudo rm /etc/sudoers.d/cpu-tune`.
 
@@ -349,8 +333,8 @@ Use `cpu-tune` for all benchmarks and performance comparisons:
 - To see the state of the machine, run `cpu-tune show --json`. If
   `changed_by_cpu_tune` is not null, another lock is active: do not reset it
   without asking the user.
-- If `cpu-tune` reports that sudo needs a password, stop and tell the user.
-  Do not run `sudo` yourself.
+- If `cpu-tune` reports that sudo needs a password, stop and tell the user to
+  run `cpu-tune sudoers --install` once. Do not run `sudo` yourself.
 ```
 
 All commands accept `--json`. Errors give `"ok": false` and an `"error"` text,

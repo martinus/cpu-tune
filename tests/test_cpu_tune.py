@@ -575,16 +575,27 @@ class SudoersTest(Case):
         self.assertFalse(data["installed"])
         self.assertIsNone(data["works"])  # sudo is not run in tests
         self.assertTrue(data["rule"].endswith(f"ALL=(root) NOPASSWD: {system_copy}"))
-        commands = [c for step in data["steps"] for c in step["commands"]]
-        self.assertEqual(commands[0], f"{SCRIPT} install --system")
-        self.assertIn(f'{system_copy} sudoers --rule > "$f"', commands)
-        self.assertIn('sudo visudo -cf "$f" && sudo install -m 440 -o root -g root "$f" /etc/sudoers.d/cpu-tune',
-                      commands)
-        self.assertEqual(commands[-1], f"sudo -k -n {system_copy} --version")
+        self.assertTrue(data["setup"].endswith("sudoers --install"))
         text = self.ok("sudoers").stdout
-        self.assertIn("Steps:", text)
-        self.assertIn("is not installed where only root can change it", text)
+        self.assertIn("Set it up with one command:", text)
+        self.assertIn(f"install cpu-tune to {system_copy}, owned by root", text)
         self.assertIn("Undo: sudo rm /etc/sudoers.d/cpu-tune", text)
+
+    def test_install(self) -> None:
+        offline = (self.root / "missing").as_uri()  # GitHub is not used in tests
+        result = self.run_tool("sudoers", "--install", "--json", CPU_TUNE_SOURCE_URL=offline)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(len(data["done"]), 2)
+        system_copy = self.root / "usr/local/bin/cpu-tune"
+        self.assertEqual(system_copy.read_bytes(), SCRIPT.read_bytes())
+        self.assertEqual(system_copy.stat().st_mode & 0o777, 0o755)
+        rule_file = self.root / "etc/sudoers.d/cpu-tune"
+        self.assertEqual(rule_file.stat().st_mode & 0o777, 0o440)
+        lines = rule_file.read_text().splitlines()
+        self.assertTrue(lines[0].startswith("# /etc/sudoers.d/cpu-tune"))
+        self.assertEqual(lines[1], data["rule"])
+        self.assertEqual(len(lines), 2)
 
     def test_rule_only(self) -> None:
         result = self.ok("sudoers", "--rule")
@@ -594,16 +605,18 @@ class SudoersTest(Case):
         self.assertTrue(lines[1].endswith(f"NOPASSWD: {self.root / 'usr/local/bin/cpu-tune'}"))
         self.assertIn("install --system", result.stderr)
 
-    def test_plan_for_a_copy_owned_by_root(self) -> None:
+    def test_guide_for_a_copy_owned_by_root(self) -> None:
         m = load_module()
-        target = Path("/usr/local/bin/cpu-tune")
-        plan = m.sudoers_plan("ann", target, target, installed=True, works=False)
-        self.assertEqual([s["text"] for s in plan["steps"]][0], "Write the rule, check it, and install it:")
-        self.assertEqual(len(plan["steps"]), 2)  # no install step
-        done = m.sudoers_plan("ann", target, target, installed=True, works=True)
-        self.assertEqual(done["steps"], [])
-        self.assertIn("Everything is set up.", "\n".join(m.render_sudoers(done)))
-        self.assertEqual(done["rule"], "ann ALL=(root) NOPASSWD: /usr/local/bin/cpu-tune")
+        status = {"user": "ann", "path": "/usr/local/bin/cpu-tune", "installed": True, "works": False,
+                  "rule": "ann ALL=(root) NOPASSWD: /usr/local/bin/cpu-tune", "file": "/etc/sudoers.d/cpu-tune",
+                  "setup": "cpu-tune sudoers --install", "undo": "sudo rm /etc/sudoers.d/cpu-tune"}
+        text = "\n".join(m.render_sudoers(status))
+        self.assertIn("cpu-tune sudoers --install", text)
+        self.assertNotIn("install cpu-tune to", text)  # the copy is there already
+        self.assertIn("ann ALL=(root) NOPASSWD: /usr/local/bin/cpu-tune", text)
+        text = "\n".join(m.render_sudoers(status | {"works": True}))
+        self.assertIn("Everything is set up.", text)
+        self.assertNotIn("sudoers --install", text)
 
     def test_owned_by_root(self) -> None:
         m = load_module()
