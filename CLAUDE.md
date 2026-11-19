@@ -96,8 +96,8 @@ shellcheck examples/*.sh
 
 ## Open
 
-- `lock`, `limit`, `reset`, `run` and `install --no-password` are not yet verified on real hardware
-  (needs sudo): Martin runs `tests/hardware_check.py`. Intel, EPYC and Raspberry Pi are covered only
-  by fake trees.
+- Verified on the Ryzen 9 7950X with 2.4.3: `tests/hardware_check.py` passed (lock, limit, reset,
+  run, run --strict, reset after SIGTERM), and with `install --no-password`, lock runs without a
+  terminal and without a password. Intel, EPYC and Raspberry Pi: only fake trees.
 - Version 2.0.0 renamed `cpu-tune` to `cputune`. Copies of 1.x look for `cpu-tune` on GitHub, so
   they cannot update; `install` and `sudoers` warn about old copies (`legacy_note`).
