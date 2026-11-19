@@ -29,9 +29,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
-__version__ = "2.1.0"  # increase it for every change: "cputune update" compares versions
+__version__ = "2.2.0"  # increase it for every change: "cputune update" compares versions
 
-SOURCE_URL = "https://raw.githubusercontent.com/martinus/cputune/main/cputune"
+# The latest release, not main: raw.githubusercontent.com caches main for 5 minutes, and a
+# release exists only after the tests passed on main.
+SOURCE_URL = "https://github.com/martinus/cputune/releases/latest/download/cputune"
 
 # Root through sudo. A sudo rule can let any program of the user start cputune as root
 # without a password, so then cputune allows only the commands that need root, and no
@@ -1352,8 +1354,8 @@ def sudoers_install(status: dict) -> list[str]:
     """Install the root-owned copy when it is missing or old, then the checked rule. Returns what it did."""
     done = []
     if not status["installed"] or status["outdated"]:
-        target, version, origin = install_copy(system=True, no_check=False)
-        done.append(f"Installed cputune {version} from {origin} to {target}")
+        target, version, origin, notes = install_copy(system=True, no_check=False)
+        done += [f"Installed cputune {version} from {origin} to {target}", *notes]
     if status["works"]:
         return done
     rule = f"# {SUDOERS_FILE}: {status['user']} can run {status['path']} as root without a password.\n"
@@ -1511,8 +1513,18 @@ def sudo_install(source: bytes, target: Path, mode: str) -> None:
         tmp.unlink()
 
 
-def install_copy(system: bool, no_check: bool) -> tuple[Path, str | None, str]:
-    """Install the newer of this file and GitHub main. Returns the path, version and origin."""
+def install_copy(system: bool, no_check: bool) -> tuple[Path, str | None, str, list[str]]:
+    """Install the newer of this file and the latest release. Returns path, version, origin, notes.
+
+    Only one copy stays installed: two copies get different versions, and the shell finds
+    the wrong one (the sudo rule names only /usr/local/bin/cputune). So when
+    /usr/local/bin/cputune exists, a user install updates that copy, and a system install
+    deletes ~/.local/bin/cputune.
+    """
+    notes = []
+    if not system and (SYSTEM_BIN / "cputune").exists():
+        system = True
+        notes.append(f"{SYSTEM_BIN / 'cputune'} exists: updated that copy, not one in {USER_BIN}")
     local = local_source()
     source, origin = local, "this file"
     if not no_check or local is None:
@@ -1534,7 +1546,26 @@ def install_copy(system: bool, no_check: bool) -> tuple[Path, str | None, str]:
     else:
         target.parent.mkdir(parents=True, exist_ok=True)
         replace_file(target, source)
-    return target, source_version(source), origin
+    if system:
+        notes += remove_user_copy()
+    return target, source_version(source), origin, notes
+
+
+def remove_user_copy() -> list[str]:
+    """Delete ~/.local/bin/cputune, which would hide /usr/local/bin/cputune in PATH. Only a cputune
+    script (or a link to one, or a broken link) goes; a symlink goes, not the file it points to."""
+    user_copy = USER_BIN / "cputune"
+    if not (user_copy.is_symlink() or user_copy.exists()):
+        return []
+    if user_copy.exists() and file_version(user_copy) is None:
+        warn(f"{user_copy} is not a cputune script, so it stays. It hides {SYSTEM_BIN / 'cputune'} in PATH.")
+        return []
+    try:
+        user_copy.unlink()
+    except OSError as e:
+        warn(f"cannot delete {user_copy}: {e.strerror}. It hides {SYSTEM_BIN / 'cputune'} in PATH.")
+        return []
+    return [f"Deleted {user_copy}: only the copy in {SYSTEM_BIN} stays"]
 
 
 def legacy_note() -> None:
@@ -1547,14 +1578,17 @@ def legacy_note() -> None:
 
 
 def cmd_install(args: argparse.Namespace) -> None:
-    target, version, origin = install_copy(args.system, args.no_check)
+    target, version, origin, notes = install_copy(args.system, args.no_check)
     path_note(target)  # before the output, so that --json has the warnings
     legacy_note()
     if args.json:
-        print_json({"ok": True, "command": "install", "path": str(target), "version": version, "source": origin})
+        print_json({"ok": True, "command": "install", "path": str(target), "version": version, "source": origin,
+                    "notes": notes})
     else:
         where = paint(str(target), BOLD, WHITE)
         say(paint("✓ ", BOLD, GREEN) + f"Installed cputune {version} from {origin} to {where}")
+        for note in notes:
+            say(paint("✓ ", BOLD, GREEN) + note)
 
 
 def cmd_update(args: argparse.Namespace) -> None:

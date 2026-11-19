@@ -9,11 +9,13 @@ their frequency, so that benchmarks give stable results. It is one Python file
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/martinus/cputune/main/cputune | python3 - install
+curl -fsSL https://github.com/martinus/cputune/releases/latest/download/cputune | python3 - install
 ```
 
-This installs `cputune` in `~/.local/bin`. `cputune update` installs a newer
-version from GitHub.
+This installs the latest release in `~/.local/bin`. `cputune update` installs a
+newer release. Only one copy stays installed: if `/usr/local/bin/cputune` exists,
+`install` updates that one, and `install --system` deletes the copy in
+`~/.local/bin`.
 
 ## Use
 

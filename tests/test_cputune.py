@@ -519,6 +519,37 @@ class InstallTest(Case):
         for data in (self.install(), self.json("sudoers")):
             self.assertIn(f"sudo rm -f {old} /etc/sudoers.d/cpu-tune", data["warnings"][0])
 
+    def test_only_one_copy_stays_installed(self) -> None:
+        user_copy = self.root / "home/.local/bin/cputune"
+        system_copy = self.root / "usr/local/bin/cputune"
+        # A copy in /usr/local/bin: a plain install updates it, and makes no second copy.
+        system_copy.parent.mkdir(parents=True)
+        system_copy.write_bytes(with_version("0.0.1"))
+        data = self.install()
+        self.assertEqual(data["path"], str(system_copy))
+        self.assertEqual(system_copy.read_bytes(), SCRIPT.read_bytes())
+        self.assertFalse(user_copy.exists())
+        self.assertIn("updated that copy", data["notes"][0])
+        # A copy in ~/.local/bin hides the system copy: install --system deletes it.
+        user_copy.parent.mkdir(parents=True)
+        user_copy.write_bytes(with_version("0.0.1"))
+        data = self.install("--system")
+        self.assertFalse(user_copy.exists())
+        self.assertIn(f"Deleted {user_copy}", data["notes"][0])
+        # A symlink (for example to a checkout) goes, the file it points to stays.
+        user_copy.symlink_to(self.copy)
+        self.install("--system")
+        self.assertFalse(user_copy.is_symlink())
+        self.assertTrue(self.copy.exists())
+
+    def test_keeps_a_file_that_is_not_cputune(self) -> None:
+        user_copy = self.root / "home/.local/bin/cputune"
+        user_copy.parent.mkdir(parents=True)
+        user_copy.write_text("#!/bin/sh\necho something else\n")
+        data = self.install("--system")
+        self.assertTrue(user_copy.exists())
+        self.assertIn("is not a cputune script, so it stays", data["warnings"][-1])
+
     def test_install_system_and_offline(self) -> None:
         data = self.install("--system")  # no remote file: the download fails
         self.assertEqual(data["path"], str(self.root / "usr/local/bin/cputune"))
@@ -582,6 +613,14 @@ class InstallTest(Case):
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("git pull", json.loads(result.stdout)["error"])
                 self.assertEqual(script.read_bytes(), SCRIPT.read_bytes())
+
+    def test_downloads_the_latest_release(self) -> None:
+        # Not raw.githubusercontent.com/.../main: it is cached for 5 minutes, so "update" right
+        # after a release found the old version.
+        m = load_module()
+        self.assertEqual(m.SOURCE_URL, "https://github.com/martinus/cputune/releases/latest/download/cputune")
+        readme = (SCRIPT.parent / "README.md").read_text()
+        self.assertIn(f"curl -fsSL {m.SOURCE_URL} | python3 - install", readme)
 
     def test_version(self) -> None:
         version = re.search(r'^__version__ = "([^"]+)"', SCRIPT.read_text(), re.M)[1]
@@ -664,7 +703,7 @@ class SudoersTest(Case):
         m = load_module()
         status = {"user": "ann", "path": "/usr/local/bin/cputune", "installed": True, "works": True,
                   "version": "1.0.0", "outdated": True, "rule": "r"}
-        install_copy = mock.Mock(return_value=(Path("/usr/local/bin/cputune"), "2.0.0", "GitHub"))
+        install_copy = mock.Mock(return_value=(Path("/usr/local/bin/cputune"), "2.0.0", "GitHub", []))
         sudo_install = mock.Mock()
         with mock.patch.multiple(m, install_copy=install_copy, sudo_install=sudo_install):
             done = m.sudoers_install(status)
