@@ -12,11 +12,12 @@ purpose with or without fee is hereby granted.
 from __future__ import annotations
 
 import argparse
-import getpass
+import pwd
 import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -28,14 +29,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
-__version__ = "1.0.0"  # increase it for every change: "cpu-tune update" compares versions
+__version__ = "1.1.0"  # increase it for every change: "cpu-tune update" compares versions
 
 SOURCE_URL = "https://raw.githubusercontent.com/martinus/cpu-tune/main/cpu-tune"
 
+# Root through sudo. A sudo rule can let any program of the user start cpu-tune as root
+# without a password, so then cpu-tune allows only the commands that need root, and no
+# command can run a program or write a file that the user chooses.
+UNDER_SUDO = os.geteuid() == 0 and "SUDO_UID" in os.environ
+SUDO_COMMANDS = ("lock", "limit", "reset", "update")
+
 # CPU_TUNE_ROOT points all paths at a fake file system tree, for tests.
 # Then cpu-tune does not run sudo, and it does not put load on real CPUs.
-TEST_MODE = "CPU_TUNE_ROOT" in os.environ
-ROOT = Path(os.environ.get("CPU_TUNE_ROOT", "/"))
+# Never under sudo: a test hook must not choose the files that root writes.
+TEST_MODE = "CPU_TUNE_ROOT" in os.environ and not UNDER_SUDO
+ROOT = Path(os.environ["CPU_TUNE_ROOT"]) if TEST_MODE else Path("/")
 CPU_BASE = ROOT / "sys/devices/system/cpu"
 STATE_FILE = ROOT / "run/cpu-tune.json"
 STATE_SHOWN = "/run/cpu-tune.json"
@@ -57,7 +65,7 @@ examples:
   cpu-tune run -- ./bench        lock, run ./bench on the locked core, then reset
   cpu-tune limit --max 2400      all cores: at most 2400 MHz
   cpu-tune reset                 undo all changes of lock and limit
-  cpu-tune sudoers               print a sudo rule, for use without a password
+  cpu-tune sudoers               show how to run cpu-tune without a password prompt
   cpu-tune install [--system]    install to ~/.local/bin (or /usr/local/bin)
   cpu-tune update                update this copy to the newest version on GitHub
 
@@ -65,9 +73,14 @@ FREQ is a number in MHz (2400), a value with a unit (2400MHz, 2.4GHz), or one
 of the words base, min, max. CPUS is a list such as 3, 2,3, 0-7 or all. lock,
 run and limit always include the SMT siblings of each CPU.
 
-lock, run, limit and reset need root. They run sudo themselves. Without a
-terminal (for example in scripts and AI agents) they use "sudo -n" and never
-ask for a password. Add --json to any command for machine-readable output.
+run executes COMMAND as your user, pinned to the locked CPUs, and always
+resets at the end. Its own messages go to stderr; stdout and the exit code are
+the ones of COMMAND.
+
+lock, run, limit and reset need root. They run sudo themselves: do not start
+cpu-tune with sudo. Without a terminal (for example in scripts and AI agents)
+they use "sudo -n" and never ask for a password; "cpu-tune sudoers --install"
+sets that up. Add --json to any command for machine-readable output.
 """
 
 
@@ -1194,26 +1207,154 @@ def cmd_run(args: argparse.Namespace) -> None:
     sys.exit(returncode)
 
 
-def cmd_sudoers(args: argparse.Namespace) -> None:
-    script = script_path()
-    user = os.environ.get("SUDO_USER") or getpass.getuser()
-    problems = []
-    for path in (script, os.path.dirname(script)):
-        st = os.stat(path)
-        if st.st_uid != 0 or st.st_mode & 0o022:
-            problems.append(f"{path} is not owned by root, or others can write it")
-    if problems:
-        warn(
-            "; ".join(problems) + ". With this rule, every program that runs as "
-            f"{user} could change cpu-tune and so get root. Install it first: "
-            "cpu-tune install --system, then run /usr/local/bin/cpu-tune sudoers"
+SUDOERS_FILE = "/etc/sudoers.d/cpu-tune"
+
+
+def owned_by_root(path: Path) -> bool:
+    """True when only root can change the file.
+
+    Root must own the file and every folder above it, and no one else may write
+    them: a user who can write any folder on the way can rename it and put
+    another file in its place. Symlinks are resolved first.
+    """
+    try:
+        real = path.resolve(strict=True)
+        for p in (real, *real.parents):
+            st = os.stat(p)
+            if st.st_uid != 0 or st.st_mode & 0o022:
+                return False
+    except (OSError, RuntimeError):
+        return False
+    return True
+
+
+def sudo_works(path: Path) -> bool | None:
+    """True when this user can run path as root without a password. None: cannot check."""
+    if TEST_MODE or not shutil.which("sudo"):
+        return None
+    try:
+        # -k: ignore a password that sudo remembers, so that only a NOPASSWD rule passes.
+        result = subprocess.run(
+            ["sudo", "-k", "-n", str(path), "--version"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
         )
-    rule = f"{user} ALL=(root) NOPASSWD: {script}"
-    if args.json:
-        print_json({"ok": not problems, "command": "sudoers", "rule": rule, "file": "/etc/sudoers.d/cpu-tune"})
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.returncode == 0
+
+
+def self_command() -> str:
+    """How the user calls this script: "cpu-tune" when the shell finds this file, else its path."""
+    found = shutil.which("cpu-tune")
+    if found and Path(found).resolve() == Path(script_path()).resolve():
+        return "cpu-tune"
+    return shlex.quote(script_path())
+
+
+def sudoers_status() -> dict:
+    """What is set up. target is the copy that the rule names: always one that only root can change."""
+    user = pwd.getpwuid(os.getuid()).pw_name  # not $USER: the environment can name anyone
+    script = Path(script_path())
+    target = script if owned_by_root(script) else SYSTEM_BIN / "cpu-tune"
+    installed = owned_by_root(target)
+    return {
+        "user": user,
+        "path": str(target),
+        "installed": installed,
+        "works": sudo_works(target) if installed else None,
+        "rule": f"{user} ALL=(root) NOPASSWD: {target}",
+        "file": SUDOERS_FILE,
+        "setup": f"{self_command()} sudoers --install",
+        "undo": f"sudo rm {SUDOERS_FILE}",
+    }
+
+
+def render_sudoers(status: dict) -> list[str]:
+    ok, bad, unknown = paint("✓", BOLD, GREEN), paint("✗", BOLD, RED), paint("?", BOLD, YELLOW)
+    path = paint(status["path"], BOLD, WHITE)
+    lines = [
+        "lock, run, limit and reset need root. In a terminal, sudo asks for your password.",
+        "Scripts and AI agents have no terminal: they need a sudo rule that lets them run",
+        "cpu-tune as root without a password.",
+        "",
+        f"  {ok if status['installed'] else bad} {path} "
+        + ("is owned by root" if status["installed"] else "is not installed where only root can change it"),
+        {True: f"  {ok} sudo runs it without a password",
+         False: f"  {bad} sudo asks for a password",
+         None: f"  {unknown} the sudo rule is not checked"}[status["works"]],
+        "",
+    ]
+    if status["works"]:
+        lines.append(paint("Everything is set up.", BOLD, GREEN))
+    else:
+        does = [] if status["installed"] else [f"install cpu-tune to {status['path']}, owned by root"]
+        does += [f"add this rule to {status['file']}, after visudo checked it:", "  " + status["rule"]]
+        lines += [
+            "Set it up with one command:",
+            "  " + paint(status["setup"], BOLD, WHITE),
+            "",
+            "It uses sudo to:",
+            *(f"  {line}" for line in does),
+        ]
+    lines += [
+        "",
+        paint("The rule names a copy that only root can change. Otherwise every program that", GRAY),
+        paint("runs as you could change cpu-tune, and so run anything as root.", GRAY),
+        paint(f"Undo: {status['undo']}", GRAY),
+    ]
+    return lines
+
+
+def sudoers_install(status: dict) -> list[str]:
+    """Install the root-owned copy when it is missing, then the checked rule. Returns what it did."""
+    done = []
+    if not status["installed"]:
+        target, version, origin = install_copy(system=True, no_check=False)
+        done.append(f"Installed cpu-tune {version} from {origin} to {target}")
+    rule = f"# {SUDOERS_FILE}: {status['user']} can run {status['path']} as root without a password.\n"
+    rule += status["rule"] + "\n"
+    if not TEST_MODE:
+        fd, name = tempfile.mkstemp(prefix="cpu-tune.sudoers.")
+        with os.fdopen(fd, "w") as f:
+            f.write(rule)
+        try:
+            # A broken file in /etc/sudoers.d can break sudo: check it before it goes there.
+            if subprocess.run([*sudo_prefix(), "visudo", "-cqf", name]).returncode != 0:
+                die("visudo rejects the rule. Nothing is installed.")
+        finally:
+            os.unlink(name)
+    sudo_install(rule.encode(), ROOT / SUDOERS_FILE.lstrip("/"), "440")
+    done.append(f"Installed the rule in {SUDOERS_FILE}")
+    return done
+
+
+def cmd_sudoers(args: argparse.Namespace) -> None:
+    status = sudoers_status()
+    if args.rule:
+        if not status["installed"]:
+            warn(f"the rule is for {status['path']}. Install cpu-tune there first: "
+                 f"{self_command()} install --system")
+        say(f"# {SUDOERS_FILE}: {status['user']} can run {status['path']} as root without a password.")
+        say(status["rule"])
         return
-    say(f"# /etc/sudoers.d/cpu-tune: {user} can run {script} as root without a password.")
-    say(rule)
+    if args.install:
+        done = [] if status["works"] else sudoers_install(status)
+        status = sudoers_status()
+        if status["works"] is False:
+            warn("the rule is installed, but sudo still asks for a password. "
+                 "Check the other rules in /etc/sudoers and /etc/sudoers.d.")
+        status["done"] = done
+    if args.json:
+        print_json({"ok": True, "command": "sudoers", **status})
+        return
+    for line in status.get("done", []):
+        say(paint("✓ ", BOLD, GREEN) + line)
+    if args.install and status["works"] is not False:
+        if status["works"]:
+            say(paint("✓ ", BOLD, GREEN) + f"{status['user']} can run {status['path']} as root without a password.")
+        say(paint(f"Undo: {status['undo']}", GRAY))
+        return
+    say("\n".join(render_sudoers(status)))
 
 
 # ------------------------------------------------------------------ install, update
@@ -1268,9 +1409,15 @@ def replace_file(target: Path, source: bytes) -> None:
 
     os.replace also replaces a symlink itself, never the file that it points to.
     """
-    tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
     try:
-        tmp.write_bytes(source)
+        # mkstemp: a new file with a random name (O_EXCL), never a symlink that someone put there.
+        fd, name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+    except OSError as e:
+        die(f"cannot write {target}: {e.strerror}")
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(source)
         tmp.chmod(0o755)
         os.replace(tmp, target)
     except OSError as e:
@@ -1293,10 +1440,36 @@ def path_note(target: Path) -> None:
         warn(f"your shell finds {found} first. Delete it, or call {target} directly.")
 
 
-def cmd_install(args: argparse.Namespace) -> None:
+def sudo_prefix() -> list[str]:
+    """sudo, which asks for a password in a terminal, and never waits for one without a terminal."""
+    return ["sudo"] if sys.stdin.isatty() else ["sudo", "-n"]
+
+
+def sudo_install(source: bytes, target: Path, mode: str) -> None:
+    """Install source as target, owned by root. Uses plain sudo, never the cpu-tune rule:
+    the rule must never let a user install a file of their choice as root."""
+    fd, name = tempfile.mkstemp(prefix="cpu-tune.")
+    tmp = Path(name)
+    with os.fdopen(fd, "wb") as f:
+        f.write(source)
+    try:
+        if TEST_MODE:  # no sudo in tests
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(tmp, target)
+            target.chmod(int(mode, 8))
+            return
+        cmd = [*sudo_prefix(), "install", "-m", mode, "-o", "root", "-g", "root", str(tmp), str(target)]
+        if subprocess.run(cmd).returncode != 0:
+            die(f"cannot install {target}: sudo install failed")
+    finally:
+        tmp.unlink()
+
+
+def install_copy(system: bool, no_check: bool) -> tuple[Path, str | None, str]:
+    """Install the newer of this file and GitHub main. Returns the path, version and origin."""
     local = local_source()
     source, origin = local, "this file"
-    if not args.no_check or local is None:
+    if not no_check or local is None:
         try:
             remote = download()
         except Error as e:
@@ -1307,29 +1480,19 @@ def cmd_install(args: argparse.Namespace) -> None:
             if local is None or version_key(source_version(remote)) > version_key(source_version(local)):
                 source, origin = remote, "GitHub"
     assert source is not None
-    version = source_version(source)
-    target = (SYSTEM_BIN if args.system else USER_BIN) / "cpu-tune"
-
+    target = (SYSTEM_BIN if system else USER_BIN) / "cpu-tune"
     if target.is_file() and not target.is_symlink() and target.read_bytes() == source:
         pass  # nothing to do
-    elif args.system and os.geteuid() != 0 and not TEST_MODE:
-        # Root copies the file. Use plain sudo for this: a sudo rule for cpu-tune
-        # must never let a user install an arbitrary file as root.
-        fd, name = tempfile.mkstemp(prefix="cpu-tune.")
-        tmp = Path(name)
-        with os.fdopen(fd, "wb") as f:
-            f.write(source)
-        sudo = ["sudo"] if sys.stdin.isatty() else ["sudo", "-n"]
-        try:
-            result = subprocess.run([*sudo, "install", "-m", "755", "-o", "root", "-g", "root", str(tmp), str(target)])
-        finally:
-            tmp.unlink()
-        if result.returncode != 0:
-            die(f"cannot install to {target}: sudo install failed")
+    elif system and os.geteuid() != 0:
+        sudo_install(source, target, "755")
     else:
         target.parent.mkdir(parents=True, exist_ok=True)
         replace_file(target, source)
+    return target, source_version(source), origin
 
+
+def cmd_install(args: argparse.Namespace) -> None:
+    target, version, origin = install_copy(args.system, args.no_check)
     if args.json:
         print_json({"ok": True, "command": "install", "path": str(target), "version": version, "source": origin})
     else:
@@ -1412,7 +1575,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("reset", parents=[common], help="undo all changes of lock, run and limit")
     p.set_defaults(func=cmd_reset)
 
-    p = sub.add_parser("sudoers", parents=[common], help="print a sudo rule, for use without a password")
+    p = sub.add_parser("sudoers", parents=[common], help="show how to run cpu-tune without a password prompt")
+    p.add_argument("--install", action="store_true", help="set it up: install the rule (and cpu-tune, if needed)")
+    p.add_argument("--rule", action="store_true", help="print only the sudo rule")
     p.set_defaults(func=cmd_sudoers)
 
     p = sub.add_parser(
@@ -1461,6 +1626,11 @@ def main() -> int:
     name = args.func.__name__[len("cmd_"):]
     if command and args.func is not cmd_run:
         build_parser().error("'-- COMMAND' is only for: cpu-tune run [FREQ] [--cpu CPUS] -- COMMAND")
+    if UNDER_SUDO and name not in SUDO_COMMANDS:
+        print(f"cpu-tune: error: do not start 'cpu-tune {name}' with sudo. cpu-tune runs sudo "
+              f"itself when it needs root. Under sudo, only these commands work: {', '.join(SUDO_COMMANDS)}",
+              file=sys.stderr)
+        return 1
 
     try:
         args.func(args)

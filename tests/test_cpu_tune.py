@@ -7,14 +7,21 @@ call sudo, and it does not put load on the real CPUs.
 
 from __future__ import annotations
 
+import contextlib
+import importlib.machinery
+import importlib.util
 import json
+import io
 import os
+import pwd
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -555,12 +562,171 @@ class InstallTest(Case):
         self.assertEqual(self.json("show")["version"], version)
 
 
+def load_module():
+    """cpu-tune as a module, to test functions that need states the tests cannot create.
+
+    The module reads the environment when it loads: patch it before the call.
+    """
+    loader = importlib.machinery.SourceFileLoader("cpu_tune", str(SCRIPT))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader("cpu_tune", loader))
+    sys.modules["cpu_tune"] = module  # @dataclass looks the module up here
+    loader.exec_module(module)
+    return module
+
+
 class SudoersTest(Case):
-    def test_rule(self) -> None:
-        result = self.ok("sudoers")
-        self.assertIn(f"NOPASSWD: {SCRIPT}", result.stdout)
+    def test_guide_when_nothing_is_set_up(self) -> None:
+        # The test checkout is not owned by root, so the rule must name the system copy.
+        system_copy = self.root / "usr/local/bin/cpu-tune"
+        data = self.json("sudoers")
+        self.assertEqual(data["path"], str(system_copy))
+        self.assertFalse(data["installed"])
+        self.assertIsNone(data["works"])  # sudo is not run in tests
+        self.assertTrue(data["rule"].endswith(f"ALL=(root) NOPASSWD: {system_copy}"))
+        self.assertTrue(data["setup"].endswith("sudoers --install"))
+        text = self.ok("sudoers").stdout
+        self.assertIn("Set it up with one command:", text)
+        self.assertIn(f"install cpu-tune to {system_copy}, owned by root", text)
+        self.assertIn("Undo: sudo rm /etc/sudoers.d/cpu-tune", text)
+
+    def test_install(self) -> None:
+        offline = (self.root / "missing").as_uri()  # GitHub is not used in tests
+        result = self.run_tool("sudoers", "--install", "--json", CPU_TUNE_SOURCE_URL=offline)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(len(data["done"]), 2)
+        system_copy = self.root / "usr/local/bin/cpu-tune"
+        self.assertEqual(system_copy.read_bytes(), SCRIPT.read_bytes())
+        self.assertEqual(system_copy.stat().st_mode & 0o777, 0o755)
+        rule_file = self.root / "etc/sudoers.d/cpu-tune"
+        self.assertEqual(rule_file.stat().st_mode & 0o777, 0o440)
+        lines = rule_file.read_text().splitlines()
+        self.assertTrue(lines[0].startswith("# /etc/sudoers.d/cpu-tune"))
+        self.assertEqual(lines[1], data["rule"])
+        self.assertEqual(len(lines), 2)
+
+    def test_rule_only(self) -> None:
+        result = self.ok("sudoers", "--rule")
+        lines = result.stdout.splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0].startswith("# /etc/sudoers.d/cpu-tune"))
+        self.assertTrue(lines[1].endswith(f"NOPASSWD: {self.root / 'usr/local/bin/cpu-tune'}"))
+        self.assertIn("install --system", result.stderr)
+
+    def test_guide_for_a_copy_owned_by_root(self) -> None:
+        m = load_module()
+        status = {"user": "ann", "path": "/usr/local/bin/cpu-tune", "installed": True, "works": False,
+                  "rule": "ann ALL=(root) NOPASSWD: /usr/local/bin/cpu-tune", "file": "/etc/sudoers.d/cpu-tune",
+                  "setup": "cpu-tune sudoers --install", "undo": "sudo rm /etc/sudoers.d/cpu-tune"}
+        text = "\n".join(m.render_sudoers(status))
+        self.assertIn("cpu-tune sudoers --install", text)
+        self.assertNotIn("install cpu-tune to", text)  # the copy is there already
+        self.assertIn("ann ALL=(root) NOPASSWD: /usr/local/bin/cpu-tune", text)
+        text = "\n".join(m.render_sudoers(status | {"works": True}))
+        self.assertIn("Everything is set up.", text)
+        self.assertNotIn("sudoers --install", text)
+
+    def test_owned_by_root(self) -> None:
+        m = load_module()
         if os.stat(SCRIPT).st_uid != 0:
-            self.assertIn("could change cpu-tune and so get root", result.stderr)
+            self.assertFalse(m.owned_by_root(SCRIPT))
+        self.assertFalse(m.owned_by_root(self.root / "missing"))
+        if Path("/usr/bin/env").stat().st_uid == 0:
+            self.assertTrue(m.owned_by_root(Path("/usr/bin/env")))
+        tmp = Path("/tmp").stat()
+        if tmp.st_uid == 0 and tmp.st_mode & 0o002:  # owned by root, but everyone can write it
+            self.assertFalse(m.owned_by_root(Path("/tmp")))
+
+
+class SecurityTest(Case):
+    """A sudo rule lets every program of the user run cpu-tune as root. These tests make
+    sure that this gives no more than the CPU settings."""
+
+    def load_as_sudo_root(self):
+        env = {"SUDO_UID": "1000", "CPU_TUNE_ROOT": str(self.root), "CPU_TUNE_SOURCE_URL": "file:///evil"}
+        with mock.patch("os.geteuid", return_value=0), mock.patch.dict(os.environ, env):
+            return load_module()
+
+    def test_sudo_allows_only_root_commands(self) -> None:
+        m = self.load_as_sudo_root()
+        self.assertTrue(m.UNDER_SUDO)
+        self.assertEqual(m.SUDO_COMMANDS, ("lock", "limit", "reset", "update"))
+        # Stubs instead of the real commands: under the simulated sudo, the test hooks are
+        # off, so a real command would change this machine if the check ever broke.
+        called: list[str] = []
+
+        def stub(name: str):
+            def cmd(args) -> None:
+                called.append(name)
+            cmd.__name__ = f"cmd_{name}"
+            return cmd
+
+        names = ("show", "watch", "lock", "run", "limit", "reset", "sudoers", "install", "update")
+        with mock.patch.multiple(m, **{f"cmd_{n}": stub(n) for n in names}):
+            for argv in (["run", "--", "sh"], ["install"], ["install", "--system"], ["sudoers", "--install"],
+                         ["show"], ["watch"]):
+                with self.subTest(argv=argv):
+                    stderr = io.StringIO()
+                    with mock.patch.object(sys, "argv", ["cpu-tune", *argv]), contextlib.redirect_stderr(stderr):
+                        self.assertEqual(m.main(), 1)
+                    self.assertIn("do not start", stderr.getvalue())
+            self.assertEqual(called, [])
+            with mock.patch.object(sys, "argv", ["cpu-tune", "lock"]):
+                self.assertEqual(m.main(), 0)
+            self.assertEqual(called, ["lock"])
+        with mock.patch.object(sys, "argv", ["cpu-tune", "--version"]), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as exit:
+                m.main()
+        self.assertEqual(exit.exception.code, 0)  # sudoers --install checks the rule with --version
+
+    def test_no_test_hooks_under_sudo(self) -> None:
+        m = self.load_as_sudo_root()
+        self.assertFalse(m.TEST_MODE)
+        self.assertEqual(m.ROOT, Path("/"))
+        self.assertEqual(m.CPU_BASE, Path("/sys/devices/system/cpu"))
+
+    def test_owned_by_root_checks_every_folder(self) -> None:
+        m = load_module()
+        path = Path("/usr/bin/env").resolve()
+        real_stat = os.stat
+
+        def fake_stat(writable: str):
+            def stat(p, *args, **kwargs):
+                if Path(p) not in (path, *path.parents):
+                    return real_stat(p, *args, **kwargs)
+                return types.SimpleNamespace(st_uid=0, st_mode=0o40775 if str(p) == writable else 0o40755)
+            return stat
+
+        with mock.patch("os.stat", fake_stat(writable="")):
+            self.assertTrue(m.owned_by_root(path))
+        top = str(list(path.parents)[-2])  # for example /usr: a folder far above the file
+        with mock.patch("os.stat", fake_stat(writable=top)):
+            self.assertFalse(m.owned_by_root(path))
+
+    def test_owned_by_root_resolves_symlinks(self) -> None:
+        m = load_module()
+        own = self.root / "own-file"
+        own.write_text("x")
+        with mock.patch.object(Path, "resolve", lambda self, strict=False: own):
+            self.assertFalse(m.owned_by_root(Path("/usr/bin/env")))  # really a link to a user file
+
+    def test_rule_names_the_real_user(self) -> None:
+        result = self.run_tool("sudoers", "--json", USER="mallory", LOGNAME="mallory")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)["rule"].startswith(f"{pwd.getpwuid(os.getuid()).pw_name} ALL="))
+
+    def test_replace_file_does_not_follow_planted_symlinks(self) -> None:
+        m = load_module()
+        folder = self.root / "bin"
+        folder.mkdir()
+        victim = self.root / "victim"
+        victim.write_text("keep")
+        for pid in range(4240, 4245):  # the names that a predictable temporary file would use
+            (folder / f".cpu-tune.{pid}.tmp").symlink_to(victim)
+        with mock.patch("os.getpid", return_value=4242):
+            m.replace_file(folder / "cpu-tune", b"new")
+        self.assertEqual(victim.read_text(), "keep")
+        self.assertEqual((folder / "cpu-tune").read_bytes(), b"new")
 
 
 if __name__ == "__main__":
