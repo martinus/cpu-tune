@@ -8,14 +8,15 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Official Python images: setup-python has no 3.9 for new Ubuntu runners.
+    container: python:${{ matrix.python }}-slim
     strategy:
+      fail-fast: false
       matrix:
         python: ["3.9", "3.14"]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
+      - run: python --version
       - run: python -m unittest discover -s tests -v
 
   version:
