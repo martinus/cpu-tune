@@ -17,6 +17,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -28,7 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
-__version__ = "1.0.0"  # increase it for every change: "cpu-tune update" compares versions
+__version__ = "1.1.0"  # increase it for every change: "cpu-tune update" compares versions
 
 SOURCE_URL = "https://raw.githubusercontent.com/martinus/cpu-tune/main/cpu-tune"
 
@@ -57,7 +58,7 @@ examples:
   cpu-tune run -- ./bench        lock, run ./bench on the locked core, then reset
   cpu-tune limit --max 2400      all cores: at most 2400 MHz
   cpu-tune reset                 undo all changes of lock and limit
-  cpu-tune sudoers               print a sudo rule, for use without a password
+  cpu-tune sudoers               show how to run cpu-tune without a password prompt
   cpu-tune install [--system]    install to ~/.local/bin (or /usr/local/bin)
   cpu-tune update                update this copy to the newest version on GitHub
 
@@ -1194,26 +1195,106 @@ def cmd_run(args: argparse.Namespace) -> None:
     sys.exit(returncode)
 
 
-def cmd_sudoers(args: argparse.Namespace) -> None:
-    script = script_path()
-    user = os.environ.get("SUDO_USER") or getpass.getuser()
-    problems = []
-    for path in (script, os.path.dirname(script)):
-        st = os.stat(path)
-        if st.st_uid != 0 or st.st_mode & 0o022:
-            problems.append(f"{path} is not owned by root, or others can write it")
-    if problems:
-        warn(
-            "; ".join(problems) + ". With this rule, every program that runs as "
-            f"{user} could change cpu-tune and so get root. Install it first: "
-            "cpu-tune install --system, then run /usr/local/bin/cpu-tune sudoers"
+SUDOERS_FILE = "/etc/sudoers.d/cpu-tune"
+
+
+def owned_by_root(path: Path) -> bool:
+    """True when only root can change the file: root owns it and its folder, and no one else can write them."""
+    try:
+        return all(st.st_uid == 0 and not st.st_mode & 0o022 for st in (path.stat(), path.parent.stat()))
+    except OSError:
+        return False
+
+
+def sudo_works(path: Path) -> bool | None:
+    """True when this user can run path as root without a password. None: cannot check."""
+    if TEST_MODE or not shutil.which("sudo"):
+        return None
+    try:
+        # -k: ignore a password that sudo remembers, so that only a NOPASSWD rule passes.
+        result = subprocess.run(
+            ["sudo", "-k", "-n", str(path), "--version"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
         )
-    rule = f"{user} ALL=(root) NOPASSWD: {script}"
-    if args.json:
-        print_json({"ok": not problems, "command": "sudoers", "rule": rule, "file": "/etc/sudoers.d/cpu-tune"})
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.returncode == 0
+
+
+def sudoers_plan(user: str, script: Path, target: Path, installed: bool, works: bool | None) -> dict:
+    """What is set up, and the steps that are still to do. target is the copy that the rule names."""
+    q = shlex.quote
+    rule = f"{user} ALL=(root) NOPASSWD: {target}"
+    steps = []
+    if not installed:
+        steps.append({"text": "Install cpu-tune where only root can change it:",
+                      "commands": [f"{q(str(script))} install --system"]})
+    if not works:
+        steps.append({"text": "Write the rule, check it, and install it:", "commands": [
+            "f=$(mktemp)",
+            f'{q(str(target))} sudoers --rule > "$f"',
+            f'sudo visudo -cf "$f" && sudo install -m 440 -o root -g root "$f" {SUDOERS_FILE}',
+            'rm "$f"',
+        ]})
+        steps.append({"text": "Check it. This must print the version, without a password prompt:",
+                      "commands": [f"sudo -k -n {q(str(target))} --version"]})
+    return {"user": user, "path": str(target), "installed": installed, "works": works, "rule": rule,
+            "file": SUDOERS_FILE, "steps": steps, "undo": f"sudo rm {SUDOERS_FILE}"}
+
+
+def render_sudoers(plan: dict) -> list[str]:
+    ok, bad, unknown = paint("✓", BOLD, GREEN), paint("✗", BOLD, RED), paint("?", BOLD, YELLOW)
+    path = paint(plan["path"], BOLD, WHITE)
+    lines = [
+        "lock, run, limit and reset need root. In a terminal, sudo asks for your password.",
+        "Scripts and AI agents have no terminal: they need a sudo rule that lets them run",
+        "cpu-tune as root without a password.",
+        "",
+        f"  {ok if plan['installed'] else bad} {path} "
+        + ("is owned by root" if plan["installed"] else "is not installed where only root can change it"),
+    ]
+    if plan["works"] is True:
+        lines.append(f"  {ok} {plan['user']} can run it as root without a password")
+    elif plan["works"] is False:
+        lines.append(f"  {bad} sudo asks for a password")
+    else:
+        lines.append(f"  {unknown} the sudo rule is not checked yet")
+    lines.append("")
+    if not plan["steps"]:
+        lines.append(paint("Everything is set up.", BOLD, GREEN))
+    else:
+        lines.append(paint("Steps:", BOLD))
+        for i, step in enumerate(plan["steps"], 1):
+            lines.append(f"  {i}. {step['text']}")
+            lines.extend("       " + paint(cmd, WHITE) for cmd in step["commands"])
+    lines += [
+        "",
+        f"The rule in {plan['file']}:",
+        "  " + paint(plan["rule"], BOLD, WHITE),
+        "",
+        paint("Root must own the file: with this rule, a program that can change the file can", GRAY),
+        paint("run anything as root.", GRAY),
+        paint(f"Undo: {plan['undo']}", GRAY),
+    ]
+    return lines
+
+
+def cmd_sudoers(args: argparse.Namespace) -> None:
+    user = os.environ.get("SUDO_USER") or getpass.getuser()
+    script = Path(script_path())
+    target = script if owned_by_root(script) else SYSTEM_BIN / "cpu-tune"
+    installed = owned_by_root(target)
+    if args.rule:
+        if not installed:
+            warn(f"the rule is for {target}. Install cpu-tune there first: {script} install --system")
+        say(f"# {SUDOERS_FILE}: {user} can run {target} as root without a password.")
+        say(f"{user} ALL=(root) NOPASSWD: {target}")
         return
-    say(f"# /etc/sudoers.d/cpu-tune: {user} can run {script} as root without a password.")
-    say(rule)
+    plan = sudoers_plan(user, script, target, installed, sudo_works(target) if installed else None)
+    if args.json:
+        print_json({"ok": True, "command": "sudoers", **plan})
+    else:
+        say("\n".join(render_sudoers(plan)))
 
 
 # ------------------------------------------------------------------ install, update
@@ -1412,7 +1493,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("reset", parents=[common], help="undo all changes of lock, run and limit")
     p.set_defaults(func=cmd_reset)
 
-    p = sub.add_parser("sudoers", parents=[common], help="print a sudo rule, for use without a password")
+    p = sub.add_parser("sudoers", parents=[common], help="show how to run cpu-tune without a password prompt")
+    p.add_argument("--rule", action="store_true", help="print only the sudo rule, for example to write it to a file")
     p.set_defaults(func=cmd_sudoers)
 
     p = sub.add_parser(

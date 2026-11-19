@@ -98,7 +98,7 @@ always undoes the lock at the end.
 | `cpu-tune run [FREQ] [--cpu CPUS] -- COMMAND` | Locks, runs `COMMAND` on the locked cores, and resets. | Yes |
 | `cpu-tune limit [--min FREQ] [--max FREQ] [--cpu CPUS]` | Sets the frequency range of cores. | Yes |
 | `cpu-tune reset` | Undoes all changes of `lock`, `run` and `limit`. | Yes |
-| `cpu-tune sudoers` | Prints a sudo rule for use without a password. | No |
+| `cpu-tune sudoers [--rule]` | Shows how to run `cpu-tune` without a password prompt. `--rule` prints only the rule. | No |
 | `cpu-tune install [--system]` | Installs to `~/.local/bin`, or to `/usr/local/bin` with `--system`. | With `--system` |
 | `cpu-tune update` | Updates this copy to the newest version on GitHub. | For a root-owned copy |
 | `cpu-tune --version` | Prints the version. | No |
@@ -285,39 +285,48 @@ a script or an AI agent, `cpu-tune` uses `sudo -n`. Then sudo never waits for a
 password. If sudo needs a password, `cpu-tune` stops with an error that tells you
 what to do.
 
-To allow `cpu-tune` without a password:
+To allow `cpu-tune` without a password, run:
 
-1. Install `cpu-tune` in a folder that only root can write:
+```sh
+cpu-tune sudoers
+```
 
-   ```sh
-   cpu-tune install --system
-   ```
-
-2. Create the sudo rule, and check it:
-
-   ```sh
-   /usr/local/bin/cpu-tune sudoers > cpu-tune.sudoers
-   sudo visudo -cf cpu-tune.sudoers
-   ```
-
-3. Install the rule:
-
-   ```sh
-   sudo install -m 440 cpu-tune.sudoers /etc/sudoers.d/cpu-tune
-   rm cpu-tune.sudoers
-   ```
-
-The rule looks like this:
+It shows what is already set up on your machine, and the steps that are still
+to do, with the exact commands. For example:
 
 ```text
-martinus ALL=(root) NOPASSWD: /usr/local/bin/cpu-tune
+  ✓ /usr/local/bin/cpu-tune is owned by root
+  ✗ sudo asks for a password
+
+Steps:
+  1. Write the rule, check it, and install it:
+       f=$(mktemp)
+       /usr/local/bin/cpu-tune sudoers --rule > "$f"
+       sudo visudo -cf "$f" && sudo install -m 440 -o root -g root "$f" /etc/sudoers.d/cpu-tune
+       rm "$f"
+  2. Check it. This must print the version, without a password prompt:
+       sudo -k -n /usr/local/bin/cpu-tune --version
+
+The rule in /etc/sudoers.d/cpu-tune:
+  martinus ALL=(root) NOPASSWD: /usr/local/bin/cpu-tune
 ```
+
+These are all the steps:
+
+1. Install `cpu-tune` in a folder that only root can change: `cpu-tune install --system`.
+2. Write the rule with `cpu-tune sudoers --rule`, check it with `visudo -cf`, and
+   install it in `/etc/sudoers.d/cpu-tune`. A broken file in `/etc/sudoers.d` can
+   break sudo, so always check it first.
+3. Check that `sudo -k -n /usr/local/bin/cpu-tune --version` prints the version.
+   `-k` makes sudo ignore a password that it remembers, so only the rule counts.
+
+To undo it: `sudo rm /etc/sudoers.d/cpu-tune`.
 
 > [!WARNING]
 > Do not use the rule for a copy of `cpu-tune` that your user can change, for
 > example in `~/.local/bin`. Then every program that runs as your user can edit
-> the script and get root. `cpu-tune sudoers` warns you when the file or its
-> folder is not owned by root.
+> the script and get root. `cpu-tune sudoers` always names a copy that only root
+> can change.
 
 If you also have a copy in `~/.local/bin`, delete it, or make sure that
 `/usr/local/bin` comes first in your `PATH`. The rule only works for the exact path.
@@ -404,6 +413,11 @@ python3 -m unittest discover -s tests
 Increase `__version__` in `cpu-tune` for every change to the script.
 `cpu-tune update` installs a new version only when its number is higher. CI
 checks this for each pull request with `tests/check_version.py`.
+
+Releases are automatic. When a new `__version__` reaches `main` and the tests
+pass, CI creates the tag `vX.Y.Z` and a
+[GitHub release](https://github.com/martinus/cpu-tune/releases) with the
+script attached.
 
 The tests build fake sysfs trees from the recorded machines in
 [tests/machines](tests/machines), and run `cpu-tune` against them. The

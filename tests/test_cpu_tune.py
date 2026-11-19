@@ -7,6 +7,8 @@ call sudo, and it does not put load on the real CPUs.
 
 from __future__ import annotations
 
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
@@ -555,12 +557,64 @@ class InstallTest(Case):
         self.assertEqual(self.json("show")["version"], version)
 
 
+def load_module():
+    """cpu-tune as a module, to test functions that need states the tests cannot create."""
+    loader = importlib.machinery.SourceFileLoader("cpu_tune", str(SCRIPT))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader("cpu_tune", loader))
+    sys.modules["cpu_tune"] = module  # @dataclass looks the module up here
+    loader.exec_module(module)
+    return module
+
+
 class SudoersTest(Case):
-    def test_rule(self) -> None:
-        result = self.ok("sudoers")
-        self.assertIn(f"NOPASSWD: {SCRIPT}", result.stdout)
+    def test_guide_when_nothing_is_set_up(self) -> None:
+        # The test checkout is not owned by root, so the rule must name the system copy.
+        system_copy = self.root / "usr/local/bin/cpu-tune"
+        data = self.json("sudoers")
+        self.assertEqual(data["path"], str(system_copy))
+        self.assertFalse(data["installed"])
+        self.assertIsNone(data["works"])  # sudo is not run in tests
+        self.assertTrue(data["rule"].endswith(f"ALL=(root) NOPASSWD: {system_copy}"))
+        commands = [c for step in data["steps"] for c in step["commands"]]
+        self.assertEqual(commands[0], f"{SCRIPT} install --system")
+        self.assertIn(f'{system_copy} sudoers --rule > "$f"', commands)
+        self.assertIn('sudo visudo -cf "$f" && sudo install -m 440 -o root -g root "$f" /etc/sudoers.d/cpu-tune',
+                      commands)
+        self.assertEqual(commands[-1], f"sudo -k -n {system_copy} --version")
+        text = self.ok("sudoers").stdout
+        self.assertIn("Steps:", text)
+        self.assertIn("is not installed where only root can change it", text)
+        self.assertIn("Undo: sudo rm /etc/sudoers.d/cpu-tune", text)
+
+    def test_rule_only(self) -> None:
+        result = self.ok("sudoers", "--rule")
+        lines = result.stdout.splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0].startswith("# /etc/sudoers.d/cpu-tune"))
+        self.assertTrue(lines[1].endswith(f"NOPASSWD: {self.root / 'usr/local/bin/cpu-tune'}"))
+        self.assertIn("install --system", result.stderr)
+
+    def test_plan_for_a_copy_owned_by_root(self) -> None:
+        m = load_module()
+        target = Path("/usr/local/bin/cpu-tune")
+        plan = m.sudoers_plan("ann", target, target, installed=True, works=False)
+        self.assertEqual([s["text"] for s in plan["steps"]][0], "Write the rule, check it, and install it:")
+        self.assertEqual(len(plan["steps"]), 2)  # no install step
+        done = m.sudoers_plan("ann", target, target, installed=True, works=True)
+        self.assertEqual(done["steps"], [])
+        self.assertIn("Everything is set up.", "\n".join(m.render_sudoers(done)))
+        self.assertEqual(done["rule"], "ann ALL=(root) NOPASSWD: /usr/local/bin/cpu-tune")
+
+    def test_owned_by_root(self) -> None:
+        m = load_module()
         if os.stat(SCRIPT).st_uid != 0:
-            self.assertIn("could change cpu-tune and so get root", result.stderr)
+            self.assertFalse(m.owned_by_root(SCRIPT))
+        self.assertFalse(m.owned_by_root(self.root / "missing"))
+        if Path("/usr/bin/env").stat().st_uid == 0:
+            self.assertTrue(m.owned_by_root(Path("/usr/bin/env")))
+        tmp = Path("/tmp").stat()
+        if tmp.st_uid == 0 and tmp.st_mode & 0o002:  # owned by root, but everyone can write it
+            self.assertFalse(m.owned_by_root(Path("/tmp")))
 
 
 if __name__ == "__main__":
