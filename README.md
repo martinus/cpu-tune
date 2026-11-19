@@ -4,7 +4,7 @@
 their frequency, so that benchmarks give stable results. It is one Python file
 (3.9 or newer) with no dependencies.
 
-![cputune show --now on a Ryzen 9 7950X, with load on three cores](docs/show.png)
+![cputune --now on a Ryzen 9 7950X, with load on three cores](docs/show.png)
 
 ## Install
 
