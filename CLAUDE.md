@@ -5,6 +5,9 @@
   Lint: `ruff check --select E,F,W,B,UP --target-version py39 --line-length 120 cpu-tune tests`.
 - Tests run against fake sysfs trees (`CPU_TUNE_ROOT`). Do not run `lock`, `run`, `limit` or `reset`
   on the real machine without asking: they change CPU settings as root.
+- Security: a sudo rule lets any program of the user run `cpu-tune` as root. Under sudo, only
+  `lock`, `limit`, `reset` and `update` may run (`SUDO_COMMANDS`), and no code that root runs may
+  execute a program, or write a file, that the user chooses. Keep it so, and test it in `SecurityTest`.
 - Every change to `cpu-tune` increases `__version__`: a fix the patch number, a new feature the minor
   number. `cpu-tune update` only installs higher versions, and CI fails the PR otherwise.
 - `main` is protected, also for admins: branch, pull request, green checks, squash merge.
