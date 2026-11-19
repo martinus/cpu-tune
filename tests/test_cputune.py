@@ -250,6 +250,13 @@ class LockTest(Case):
         self.assertEqual(self.snapshot(), before)
         self.assertFalse(self.state.exists())
 
+    def test_taskset_names_the_requested_cpus(self) -> None:
+        data = self.json("lock", "-c", "2")
+        self.assertEqual((data["cpus"], data["pin_cpus"], data["taskset"]), ([2, 3], [2], "taskset -c 2"))
+        data = self.json("lock")
+        self.assertEqual((data["cpus"], data["pin_cpus"], data["taskset"]), ([8, 9], [8, 9], "taskset -c 8,9"))
+        self.assertIn("taskset -c 2 ./bench", self.ok("lock", "--cpu", "2").stdout)
+
     def test_cpu_lists_include_siblings(self) -> None:
         self.assertEqual(self.json("lock", "--cpu", "0")["cpus"], [0, 1])
         self.assertEqual(self.json("lock", "--cpu", "16")["cpus"], [16])
@@ -413,11 +420,22 @@ class RunTest(Case):
         before = self.snapshot()
         code = "import os; print(os.environ['CPUTUNE_CPUS'])"
         result = self.ok("run", "--cpu", "4", "--", sys.executable, "-c", code)
-        self.assertEqual(result.stdout, "4,5\n")  # cputune messages go to stderr
-        self.assertIn("locked cpu 4,5 at 2200 MHz", result.stderr)
+        self.assertEqual(result.stdout, "4\n")  # only the named CPU; cputune messages go to stderr
+        self.assertIn("locked cpu 4,5 at 2200 MHz", result.stderr)  # the whole core
+        self.assertIn("running on cpu 4:", result.stderr)
         self.assertIn("reset done", result.stderr)
         self.assertEqual(self.snapshot(), before)
         self.assertFalse(self.state.exists())
+
+    def test_pins_to_the_named_cpus(self) -> None:
+        code = "import os; print(os.environ['CPUTUNE_CPUS'])"
+        self.assertEqual(self.ok("run", "--", sys.executable, "-c", code).stdout, "8,9\n")  # default: whole core
+        self.assertEqual(self.ok("run", "-c", "2", "--", sys.executable, "-c", code).stdout, "2\n")
+        self.assertEqual(self.ok("run", "-c", "2,16", "--", sys.executable, "-c", code).stdout, "2,16\n")
+        self.assertEqual(self.ok("run", "-c", "all", "--", sys.executable, "-c", code).stdout, "0-31\n")
+        if len(os.sched_getaffinity(0)) > 3:  # the real pinning, where the test machine has these CPUs
+            code = "import os; print(sorted(os.sched_getaffinity(0)))"
+            self.assertEqual(self.ok("run", "-c", "3", "--", sys.executable, "-c", code).stdout, "[3]\n")
 
     def test_exit_code_and_json(self) -> None:
         result = self.run_tool("run", "1500", "--json", "--", sys.executable, "-c", "raise SystemExit(7)")
@@ -595,7 +613,7 @@ class SudoersTest(Case):
         self.assertTrue(data["setup"].endswith("sudoers --install"))
         text = self.ok("sudoers").stdout
         self.assertIn("Set it up with one command:", text)
-        self.assertIn(f"install cputune to {system_copy}, owned by root", text)
+        self.assertIn(f"install the newest cputune to {system_copy}, owned by root", text)
         self.assertIn("Undo: sudo rm /etc/sudoers.d/cputune", text)
 
     def test_install(self) -> None:
@@ -625,15 +643,34 @@ class SudoersTest(Case):
     def test_guide_for_a_copy_owned_by_root(self) -> None:
         m = load_module()
         status = {"user": "ann", "path": "/usr/local/bin/cputune", "installed": True, "works": False,
+                  "version": "2.0.0", "outdated": False,
                   "rule": "ann ALL=(root) NOPASSWD: /usr/local/bin/cputune", "file": "/etc/sudoers.d/cputune",
                   "setup": "cputune sudoers --install", "undo": "sudo rm /etc/sudoers.d/cputune"}
         text = "\n".join(m.render_sudoers(status))
         self.assertIn("cputune sudoers --install", text)
-        self.assertNotIn("install cputune to", text)  # the copy is there already
+        self.assertNotIn("install the newest", text)  # the copy is there already
         self.assertIn("ann ALL=(root) NOPASSWD: /usr/local/bin/cputune", text)
         text = "\n".join(m.render_sudoers(status | {"works": True}))
         self.assertIn("Everything is set up.", text)
         self.assertNotIn("sudoers --install", text)
+        # The rule works, but the copy is older than the one the user runs: root would run old code.
+        text = "\n".join(m.render_sudoers(status | {"works": True, "outdated": True}))
+        self.assertIn("/usr/local/bin/cputune is version 2.0.0: older than this copy", text)
+        self.assertIn("install the newest cputune to /usr/local/bin/cputune", text)
+        self.assertNotIn("add this rule", text)
+        self.assertNotIn("Everything is set up.", text)
+
+    def test_install_updates_an_old_copy_and_keeps_a_working_rule(self) -> None:
+        m = load_module()
+        status = {"user": "ann", "path": "/usr/local/bin/cputune", "installed": True, "works": True,
+                  "version": "1.0.0", "outdated": True, "rule": "r"}
+        install_copy = mock.Mock(return_value=(Path("/usr/local/bin/cputune"), "2.0.0", "GitHub"))
+        sudo_install = mock.Mock()
+        with mock.patch.multiple(m, install_copy=install_copy, sudo_install=sudo_install):
+            done = m.sudoers_install(status)
+        install_copy.assert_called_once_with(system=True, no_check=False)
+        sudo_install.assert_not_called()  # the rule works: it stays as it is
+        self.assertEqual(done, ["Installed cputune 2.0.0 from GitHub to /usr/local/bin/cputune"])
 
     def test_owned_by_root(self) -> None:
         m = load_module()
@@ -645,6 +682,80 @@ class SudoersTest(Case):
         tmp = Path("/tmp").stat()
         if tmp.st_uid == 0 and tmp.st_mode & 0o002:  # owned by root, but everyone can write it
             self.assertFalse(m.owned_by_root(Path("/tmp")))
+
+
+class RootCopyTest(Case):
+    """With a sudo rule, root must run the root-owned /usr/local/bin/cputune, whichever copy the
+    user started: the rule names only that copy, and root must not run a copy the user can change."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.m = load_module()
+        self.mine = self.root / "home/.local/bin/cputune"
+        self.system = self.root / "usr/local/bin/cputune"
+        for path, version in ((self.mine, "2.1.0"), (self.system, "2.1.0")):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(with_version(version))
+            path.chmod(0o755)
+        self.patches = [
+            mock.patch("os.geteuid", return_value=1000),  # CI runs the tests as root
+            mock.patch.object(self.m, "SYSTEM_BIN", self.system.parent),
+            mock.patch.object(self.m, "script_path", lambda: str(self.mine)),
+            mock.patch.object(sys.stdin, "isatty", lambda: False),
+        ]
+        for patch in self.patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def root_owned(self, *paths: Path):
+        return mock.patch.object(self.m, "owned_by_root", lambda p: Path(p) in paths)
+
+    def test_sudo_runs_the_root_owned_copy(self) -> None:
+        with self.root_owned(self.system):
+            self.assertEqual(self.m.root_command(["lock"]), ["sudo", "-n", str(self.system), "lock"])
+        self.assertEqual(self.m.WARNINGS, [])
+
+    def test_without_root_owned_copy_sudo_runs_this_copy(self) -> None:
+        with self.root_owned():
+            self.assertEqual(self.m.root_command(["lock"]), ["sudo", "-n", str(self.mine), "lock"])
+
+    def test_warns_when_the_root_owned_copy_is_older(self) -> None:
+        self.system.write_bytes(with_version("2.0.0"))
+        with self.root_owned(self.system), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.m.root_command(["lock"])[2], str(self.system))
+        self.assertIn("older than this copy (2.1.0)", self.m.WARNINGS[0])
+
+    def test_update_also_updates_the_root_owned_copy(self) -> None:
+        self.system.write_bytes(with_version("2.0.0"))
+        run_root = mock.Mock(return_value=subprocess.CompletedProcess([], 0, ""))
+        with self.root_owned(self.system), mock.patch.object(self.m, "run_root", run_root):
+            self.assertEqual(self.m.update_root_copy(self.mine, "2.1.0", quiet=False),
+                             {"path": str(self.system), "updated": True})
+            run_root.assert_called_once_with(["update"], capture=False)
+            run_root.reset_mock()
+            self.system.write_bytes(with_version("2.1.0"))  # up to date: no sudo
+            self.assertFalse(self.m.update_root_copy(self.mine, "2.1.0", quiet=False)["updated"])
+            run_root.assert_not_called()
+        with self.root_owned(), mock.patch.object(self.m, "run_root", run_root):  # no root-owned copy
+            self.assertIsNone(self.m.update_root_copy(self.mine, "9.0.0", quiet=False))
+            run_root.assert_not_called()
+
+
+    def test_status_finds_an_old_root_owned_copy(self) -> None:
+        self.system.write_bytes(with_version("2.0.0"))
+        with self.root_owned(self.system), mock.patch.object(self.m, "sudo_works", lambda p: True):
+            status = self.m.sudoers_status()
+        self.assertEqual((status["path"], status["version"], status["outdated"]), (str(self.system), "2.0.0", True))
+        self.system.write_bytes(with_version("2.1.0"))
+        with self.root_owned(self.system), mock.patch.object(self.m, "sudo_works", lambda p: True):
+            self.assertFalse(self.m.sudoers_status()["outdated"])
+
+    def test_update_command_calls_the_root_copy_update(self) -> None:
+        update_root_copy = mock.Mock(return_value=None)
+        with mock.patch.multiple(self.m, download=lambda: with_version("2.1.0"),
+                                 update_root_copy=update_root_copy, OUT=io.StringIO()):  # OUT: print_json
+            self.m.cmd_update(types.SimpleNamespace(json=True))
+        update_root_copy.assert_called_once_with(self.mine, "2.1.0", True)
 
 
 class SecurityTest(Case):

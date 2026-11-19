@@ -51,7 +51,9 @@ shellcheck examples/*.sh
 
 - Security: a sudo rule lets every program of the user run `cputune` as root. Under sudo only
   `lock`, `limit`, `reset` and `update` run (`SUDO_COMMANDS`), the test hooks are off, and no root
-  code may run a program or write a file that the user chooses. Keep it so; test it in `SecurityTest`.
+  code may run a program or write a file that the user chooses. When a root-owned
+  `/usr/local/bin/cputune` exists, sudo always runs that copy (`root_copy`): the rule names it, and
+  root must not run a copy the user can change. Keep it so; test it in `SecurityTest`, `RootCopyTest`.
 - Every change to `cputune` increases `__version__`: fix = patch, feature = minor, breaking change
   (command, path or variable names) = major. `update` only installs higher versions; CI fails the
   PR otherwise.
