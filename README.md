@@ -22,6 +22,7 @@ newer release. Only one copy stays installed: if `/usr/local/bin/cputune` exists
 ```sh
 cputune                       # show the cores, best rank first
 cputune watch                 # live view of the core frequencies
+cputune check                 # find what makes benchmark results vary
 cputune run -- ./bench        # lock the best core, run ./bench on it, then reset
 cputune run -c 2 -- ./bench   # the same on CPU 2, as taskset -c 2: same CPU every time
 cputune lock                  # lock the best core (without CPU 0) at base frequency
@@ -39,6 +40,12 @@ your user, and always resets, also after Ctrl+C. Without `-c`, it picks the
 best-ranked core. With `-c`, the command runs on exactly these CPUs, so results
 stay comparable between runs. `lock` and `run` always lock the whole core: SMT
 siblings share one frequency.
+
+`run` also checks the machine (as `check` does) and measures the frequency
+while the command runs. It warns when something can make the result vary: other
+load, a power service such as `power-profiles-daemon`, battery power, a hot CPU
+that runs slower, or settings that another program changed. With `--strict`,
+the command does not run when the measured frequency is not the lock.
 
 `cputune --help` and `cputune <command> --help` show all options. All commands
 accept `--json`.
@@ -68,15 +75,17 @@ Copy this into the instructions of your agent, for example `AGENTS.md` or `CLAUD
 For benchmarks, use `cputune run -- <command>`. It locks a fast core at a fixed
 frequency, runs the command on it, and resets. To compare runs, always use the
 same CPU: `cputune run -c 2 -- <command>`. stdout and the exit code are the
-ones of the command. `cputune show --json` shows the state of the machine. If
-`cputune` says that sudo needs a password, stop and ask the user to run
-`cputune sudoers --install`.
+ones of the command. When cputune prints a warning, the result may vary: tell
+the user. With `--json`, cputune writes JSON to stderr, with `"stable": false`
+and the `warnings`. If `cputune` says that sudo needs a password, stop and ask
+the user to run `cputune sudoers --install`.
 ```
 
 ## Development
 
 ```sh
-python3 -m unittest discover -s tests
+python3 tests/run.py                  # all tests, in parallel (a few seconds)
+python3 tests/hardware_check.py       # lock, limit, reset and run on this machine (uses sudo)
 ```
 
 The tests run against fake sysfs trees, built from the recorded machines in

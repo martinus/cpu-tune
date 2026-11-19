@@ -28,6 +28,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 import fake_sysfs  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parent.parent / "cputune"
+# Fake trees in memory when possible: a test builds hundreds of small files, 8 times faster there.
+# Docker mounts /dev/shm noexec: a test that runs files of its tree sets tmp = None (disk).
+TMP = "/dev/shm" if os.access("/dev/shm", os.W_OK) else None
 
 
 def fake_sysfs_cpus(text: str) -> list[int]:
@@ -40,9 +43,10 @@ def fake_sysfs_cpus(text: str) -> list[int]:
 
 class Case(unittest.TestCase):
     machine = "intel-i9-13950hx"
+    tmp = TMP
 
     def setUp(self) -> None:
-        self.root = Path(tempfile.mkdtemp(prefix="cputune-test-"))
+        self.root = Path(tempfile.mkdtemp(prefix="cputune-test-", dir=self.tmp))
         self.addCleanup(shutil.rmtree, self.root)
         fake_sysfs.build(self.root, self.machine)
         self.cpu = self.root / "sys/devices/system/cpu"
@@ -212,7 +216,8 @@ class LockTest(Case):
             self.assertEqual(self.f(cpu, "scaling_min_freq"), "2200000")
             self.assertEqual(self.f(cpu, "scaling_max_freq"), "2200000")
         # Other cores do not change.
-        changed = {k for k in self.snapshot() if self.snapshot()[k] != before[k]}
+        after = self.snapshot()
+        changed = {k for k in after if after[k] != before[k]}
         self.assertTrue(all("cpu8/" in k or "cpu9/" in k or "no_turbo" in k for k in changed), changed)
         state = json.loads(self.state.read_text())
         self.assertEqual(state["cpus"]["8"]["max"], 5500000)
@@ -414,6 +419,35 @@ class ResetTest(Case):
         self.state.write_text("{not json")
         self.assertIn("sudo rm /run/cputune.json", self.fails("reset").stderr)
 
+    def test_state_from_an_earlier_boot_is_ignored(self) -> None:
+        self.ok("lock")
+        self.assertEqual(json.loads(self.state.read_text())["boot_id"], fake_sysfs.BOOT_ID)
+        self.ok("reset")
+        # A reboot reset all settings. The saved values of the earlier boot must not come back.
+        stale = {"boot_id": "an-earlier-boot", "cpus": {"8": {"governor": "performance", "epp": None,
+                                                              "min": 1000000, "max": 1000000}}, "boost": {}}
+        self.state.write_text(json.dumps(stale))
+        self.assertIsNone(self.json("show")["changed_by_cputune"])
+        data = self.json("lock", "--exclusive")  # not refused: nothing is changed in this boot
+        state = json.loads(self.state.read_text())
+        self.assertEqual((state["boot_id"], state["cpus"]["8"]["max"]), (fake_sysfs.BOOT_ID, 5500000))
+        self.assertEqual(data["cpus"], [8, 9])
+        self.ok("reset")
+        self.assertEqual(self.f(8, "scaling_max_freq"), "5500000")
+        self.state.write_text(json.dumps(stale))
+        self.assertFalse(self.json("reset")["restored"])
+        self.assertFalse(self.state.exists())  # root deletes the stale file
+        self.assertEqual(self.f(8, "scaling_max_freq"), "5500000")
+
+    def test_state_without_boot_id_is_used(self) -> None:
+        # cputune 2.2.0 and older wrote no boot ID: such a file is from this boot.
+        self.ok("lock")
+        state = json.loads(self.state.read_text())
+        del state["boot_id"]
+        self.state.write_text(json.dumps(state))
+        self.assertEqual(self.json("show")["changed_by_cputune"]["cpus"], [8, 9])
+        self.assertTrue(self.json("reset")["restored"])
+
 
 class RunTest(Case):
     def test_runs_pinned_and_resets(self) -> None:
@@ -470,6 +504,134 @@ class RunTest(Case):
         self.assertIn("give the command after --", self.fails("run").stderr)
         self.assertIn("cannot run", self.fails("run", "--", "/does/not/exist").stderr)
         self.assertFalse(self.state.exists())
+
+
+    def run_json(self, *args: str, code: int = 0) -> dict:
+        result = self.run_tool("run", "--json", *args)
+        self.assertEqual(result.returncode, code, result.stderr)
+        return json.loads(result.stderr[result.stderr.index("{"):])  # stdout belongs to the command
+
+    def test_measures_while_the_command_runs(self) -> None:
+        for cpu in (8, 9):
+            self.set_f(cpu, "scaling_cur_freq", 2200000)  # the frequency of the lock
+        data = self.run_json("--", sys.executable, "-c", "pass")
+        self.assertTrue(data["stable"])
+        self.assertNotIn("warnings", data)
+        core = data["cores"][0]
+        self.assertEqual((core["run_avg_mhz"], core["run_min_mhz"], core["throttled"]), (2200, 2200, 0))
+        result = self.ok("run", "--", "true")
+        self.assertIn("cpu 8,9 ran at 2200 MHz (lowest 2200 MHz), not throttled", result.stderr)
+        self.assertNotIn("may vary", result.stderr)
+
+    def test_finds_problems_while_the_command_runs(self) -> None:
+        for cpu in (8, 9):
+            self.set_f(cpu, "scaling_cur_freq", 2200000)
+        # The command plays the kernel and another program: the CPU gets too hot, and boost goes on.
+        code = (f"from pathlib import Path; d = Path({str(self.cpu)!r})\n"
+                "(d / 'cpu8/thermal_throttle/core_throttle_count').write_text('3')\n"
+                "for c in (8, 9): (d / f'cpu{c}/cpufreq/scaling_cur_freq').write_text('1500000')\n"
+                "(d / 'intel_pstate/no_turbo').write_text('0')\n")
+        data = self.run_json("--", sys.executable, "-c", code)
+        self.assertFalse(data["stable"])
+        core = data["cores"][0]
+        self.assertEqual((core["run_min_mhz"], core["throttled"]), (1500, 3))
+        warnings = "\n".join(data["warnings"])
+        self.assertIn("cpu 8,9 was too hot and ran slower 3 times", warnings)
+        self.assertIn("but the lock is 2200 MHz (too hot, or at its power limit)", warnings)
+        self.assertIn(f"another program changed the lock while the command ran: {self.cpu}/intel_pstate/no_turbo",
+                      warnings)
+        self.assertFalse(self.state.exists())  # reset
+
+    def test_warns_about_what_check_finds(self) -> None:
+        fake_sysfs.w(self.root / "proc/4321/comm", "power-profiles-")
+        for cpu in (8, 9):
+            self.set_f(cpu, "scaling_cur_freq", 2200000)
+        data = self.run_json("--", "true")
+        self.assertFalse(data["stable"])
+        self.assertIn("power-profiles-daemon runs", data["warnings"][0])
+        self.assertIn("sudo systemctl stop power-profiles-daemon", data["warnings"][0])
+
+    def test_strict(self) -> None:
+        before = self.snapshot()
+        marker = self.root / "ran"
+        command = ("--", sys.executable, "-c", f"open({str(marker)!r}, 'w')")
+        result = self.fails("run", "--strict", *command)  # the fake tree measures 3100 MHz, the lock is 2200
+        self.assertIn("the lock is not verified: cpu 8,9: measured 3100 MHz under load", result.stderr)
+        self.assertIn("With --strict, the command does not run.", result.stderr)
+        self.assertFalse(marker.exists())
+        self.assertFalse(self.state.exists())
+        self.assertEqual(self.snapshot(), before)
+        for cpu in (8, 9):
+            self.set_f(cpu, "scaling_cur_freq", 2200000)
+        self.ok("run", "--strict", *command)
+        self.assertTrue(marker.exists())
+
+
+class CheckTest(Case):
+    def levels(self, data: dict) -> dict[str, str]:
+        return {item["name"]: item["level"] for item in data["checks"]}
+
+    def test_quiet_machine(self) -> None:
+        data = self.json("check")
+        self.assertEqual(data["cpus"], [8, 9])  # the core that run uses
+        self.assertTrue(data["clean"])
+        self.assertEqual(self.levels(data), {"service": "ok", "battery": "ok", "aslr": "note"})
+        text = self.ok("check").stdout
+        self.assertIn("Checks for cpu 8,9 (the core that lock and run use)", text)
+        self.assertIn("Turn it off for one command: setarch -R COMMAND", text)
+        self.assertIn("Nothing found that makes results vary.", text)
+
+    def test_finds_problems(self) -> None:
+        for pid, comm in ((10, "power-profiles-"), (11, "tuned"), (12, "bash")):
+            fake_sysfs.w(self.root / f"proc/{pid}/comm", comm)
+        (self.root / "sys/class/power_supply/AC/online").write_text("0\n")
+        self.ok("lock", "--cpu", "2")
+        before = self.snapshot()
+        data = self.json("check", "--cpu", "0")
+        self.assertEqual(self.snapshot(), before)  # check changes nothing
+        self.assertEqual(data["cpus"], [0, 1])
+        self.assertFalse(data["clean"])
+        warnings = [item["fix"] for item in data["checks"] if item["level"] == "warn"]
+        self.assertEqual(warnings, ["cputune reset", "Stop it until the next reboot: sudo systemctl stop "
+                                    "power-profiles-daemon", "Stop it until the next reboot: sudo systemctl "
+                                    "stop tuned", "Connect the power supply."])
+        self.assertEqual([i["name"] for i in data["checks"] if i["level"] == "note"], ["aslr", "cpu 0"])
+        self.assertIn("4 problems can make results vary.", self.ok("check", "--cpu", "0").stdout)
+
+    def test_desktop_without_aslr(self) -> None:
+        shutil.rmtree(self.root)
+        fake_sysfs.build(self.root, "amd-ryzen9-7950x")
+        (self.root / "proc/sys/kernel/randomize_va_space").write_text("0\n")
+        data = self.json("check")
+        self.assertEqual(self.levels(data), {"service": "ok", "aslr": "ok"})  # no power supply in sysfs
+        self.assertTrue(data["clean"])
+
+    def test_load(self) -> None:
+        with mock.patch.dict(os.environ, CPUTUNE_ROOT=str(self.root)):
+            m = load_module()
+        # CPU 8 is 50% busy, the machine 58%.
+        times = iter([{0: (0, 100), 2: (0, 100), 8: (0, 100), 9: (0, 100)},
+                      {0: (90, 200), 2: (90, 200), 8: (50, 200), 9: (1, 200)}])
+        with mock.patch.object(m, "cpu_times", lambda: next(times)), mock.patch("os.sched_setaffinity"):
+            items = {item["name"]: item for item in m.run_checks([8, 9])}
+        self.assertEqual(items["load"]["level"], "warn")
+        self.assertIn("cpu 8 50% busy", items["load"]["text"])
+        self.assertEqual(items["machine load"]["level"], "warn")
+        self.assertIn("The machine is 58% busy", items["machine load"]["text"])
+        times = iter([{8: (0, 100), 9: (0, 100)}, {8: (5, 200), 9: (0, 200)}])
+        with mock.patch.object(m, "cpu_times", lambda: next(times)), mock.patch("os.sched_setaffinity"):
+            items = {item["name"]: item for item in m.run_checks([8, 9])}
+        self.assertEqual(items["load"], {"name": "load", "level": "ok", "text": "No other load on cpu 8,9.",
+                                         "fix": None})
+        self.assertNotIn("machine load", items)
+
+    def test_reads_the_real_proc_stat(self) -> None:
+        m = load_module()
+        if Path("/proc/stat").exists():
+            self.assertTrue(m.cpu_times())
+
+    def test_bad_cpu(self) -> None:
+        self.assertIn("cpu99 has no cpufreq", self.fails("check", "--cpu", "99").stderr)
 
 
 def with_version(version: str) -> bytes:
@@ -641,8 +803,19 @@ def load_module():
 
 
 class SudoersTest(Case):
+    def setUp(self) -> None:
+        super().setUp()
+        # A copy that root does not own, also when the tests run as root in a checkout owned by root.
+        self.script = self.root / "checkout/cputune"
+        self.script.parent.mkdir()
+        self.script.parent.chmod(0o777)
+        shutil.copy(SCRIPT, self.script)
+
+    def run_tool(self, *args: str, script: Path | None = None, **kwargs):
+        return super().run_tool(*args, script=script or self.script, **kwargs)
+
     def test_guide_when_nothing_is_set_up(self) -> None:
-        # The test checkout is not owned by root, so the rule must name the system copy.
+        # This copy is not owned by root, so the rule must name the system copy.
         system_copy = self.root / "usr/local/bin/cputune"
         data = self.json("sudoers")
         self.assertEqual(data["path"], str(system_copy))
@@ -726,6 +899,8 @@ class SudoersTest(Case):
 class RootCopyTest(Case):
     """With a sudo rule, root must run the root-owned /usr/local/bin/cputune, whichever copy the
     user started: the rule names only that copy, and root must not run a copy the user can change."""
+
+    tmp = None  # root_command checks that the copies are executable: not on a noexec /dev/shm
 
     def setUp(self) -> None:
         super().setUp()
