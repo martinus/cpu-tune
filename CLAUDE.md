@@ -54,6 +54,8 @@ shellcheck examples/*.sh
   code may run a program or write a file that the user chooses. When a root-owned
   `/usr/local/bin/cputune` exists, sudo always runs that copy (`root_copy`): the rule names it, and
   root must not run a copy the user can change. Keep it so; test it in `SecurityTest`, `RootCopyTest`.
+- Only one installed copy (`install_copy`): with `/usr/local/bin/cputune`, `install` updates it, and
+  `install --system` deletes `~/.local/bin/cputune`. Two copies drift apart, and PATH finds the wrong one.
 - Every change to `cputune` increases `__version__`: fix = patch, feature = minor, breaking change
   (command, path or variable names) = major. `update` only installs higher versions; CI fails the
   PR otherwise.
@@ -62,7 +64,8 @@ shellcheck examples/*.sh
   branch deletion, without an explicit request.
 - Releases are automatic: after a merge to `main` with green tests, the `release` job creates the
   tag `vX.Y.Z` and the GitHub release with `cputune` attached. Do not tag by hand. Check it with
-  `gh release view vX.Y.Z`.
+  `gh release view vX.Y.Z`. `install` and `update` download the latest release (`SOURCE_URL`), not
+  `main`: raw.githubusercontent.com caches `main` for 5 minutes.
 - README: short (under 100 lines), install and use first; details go to `--help`. Martin: nobody
   reads a wall of text. Plain language (ISO 24495, ASD-STE100): short sentences, active voice.
 
