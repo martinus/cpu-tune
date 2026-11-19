@@ -1,4 +1,4 @@
-"""Build a fake /sys, /proc and /run tree for cpu-tune tests.
+"""Build a fake /sys, /proc and /run tree for cputune tests.
 
 The trees come from the files in tests/machines/. Each file is the output of
 the old core_ranks.py on a real machine. This module adds the files that the

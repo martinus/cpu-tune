@@ -7,9 +7,9 @@
 # per run: "<bogo ops/s> <cpu>". Lock both cores first, so that boost and the
 # governor do not change the result:
 #
-#   cpu-tune lock --cpu CPU_A,CPU_B
+#   cputune lock --cpu CPU_A,CPU_B
 #   examples/compare-cores.sh CPU_A CPU_B
-#   cpu-tune reset
+#   cputune reset
 set -euo pipefail
 
 if [[ $# -lt 2 ]]; then

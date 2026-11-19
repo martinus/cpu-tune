@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""cpu-tune: rank the CPU cores, and lock or limit CPU frequencies for stable benchmarks.
+"""cputune: rank the CPU cores, and lock or limit CPU frequencies for stable benchmarks.
 
 One file, Python 3.9 or newer, standard library only. Reads and writes Linux sysfs.
-https://github.com/martinus/cpu-tune
+https://github.com/martinus/cputune
 
 --- 0BSD License ---
 Permission to use, copy, modify, and/or distribute this software for any
@@ -29,24 +29,24 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
-__version__ = "1.1.0"  # increase it for every change: "cpu-tune update" compares versions
+__version__ = "2.0.0"  # increase it for every change: "cputune update" compares versions
 
-SOURCE_URL = "https://raw.githubusercontent.com/martinus/cpu-tune/main/cpu-tune"
+SOURCE_URL = "https://raw.githubusercontent.com/martinus/cputune/main/cputune"
 
-# Root through sudo. A sudo rule can let any program of the user start cpu-tune as root
-# without a password, so then cpu-tune allows only the commands that need root, and no
+# Root through sudo. A sudo rule can let any program of the user start cputune as root
+# without a password, so then cputune allows only the commands that need root, and no
 # command can run a program or write a file that the user chooses.
 UNDER_SUDO = os.geteuid() == 0 and "SUDO_UID" in os.environ
 SUDO_COMMANDS = ("lock", "limit", "reset", "update")
 
-# CPU_TUNE_ROOT points all paths at a fake file system tree, for tests.
-# Then cpu-tune does not run sudo, and it does not put load on real CPUs.
+# CPUTUNE_ROOT points all paths at a fake file system tree, for tests.
+# Then cputune does not run sudo, and it does not put load on real CPUs.
 # Never under sudo: a test hook must not choose the files that root writes.
-TEST_MODE = "CPU_TUNE_ROOT" in os.environ and not UNDER_SUDO
-ROOT = Path(os.environ["CPU_TUNE_ROOT"]) if TEST_MODE else Path("/")
+TEST_MODE = "CPUTUNE_ROOT" in os.environ and not UNDER_SUDO
+ROOT = Path(os.environ["CPUTUNE_ROOT"]) if TEST_MODE else Path("/")
 CPU_BASE = ROOT / "sys/devices/system/cpu"
-STATE_FILE = ROOT / "run/cpu-tune.json"
-STATE_SHOWN = "/run/cpu-tune.json"
+STATE_FILE = ROOT / "run/cputune.json"
+STATE_SHOWN = "/run/cputune.json"
 USER_BIN = ROOT / "home/.local/bin" if TEST_MODE else Path.home() / ".local/bin"
 SYSTEM_BIN = ROOT / "usr/local/bin"
 
@@ -57,17 +57,17 @@ Shows the CPU cores ranked by speed, and locks or limits CPU frequencies, so
 that benchmarks give stable results.
 
 examples:
-  cpu-tune                       show the cores, best rank first
-  cpu-tune show --now            also measure the current frequency (1 s)
-  cpu-tune watch                 live view of the core frequencies
-  cpu-tune lock                  lock the best core (without CPU 0) at base frequency
-  cpu-tune lock 3GHz --cpu 2     lock CPU 2 and its SMT sibling at 3000 MHz
-  cpu-tune run -- ./bench        lock, run ./bench on the locked core, then reset
-  cpu-tune limit --max 2400      all cores: at most 2400 MHz
-  cpu-tune reset                 undo all changes of lock and limit
-  cpu-tune sudoers               show how to run cpu-tune without a password prompt
-  cpu-tune install [--system]    install to ~/.local/bin (or /usr/local/bin)
-  cpu-tune update                update this copy to the newest version on GitHub
+  cputune                       show the cores, best rank first
+  cputune show --now            also measure the current frequency (1 s)
+  cputune watch                 live view of the core frequencies
+  cputune lock                  lock the best core (without CPU 0) at base frequency
+  cputune lock 3GHz --cpu 2     lock CPU 2 and its SMT sibling at 3000 MHz
+  cputune run -- ./bench        lock, run ./bench on the locked core, then reset
+  cputune limit --max 2400      all cores: at most 2400 MHz
+  cputune reset                 undo all changes of lock and limit
+  cputune sudoers               show how to run cputune without a password prompt
+  cputune install [--system]    install to ~/.local/bin (or /usr/local/bin)
+  cputune update                update this copy to the newest version on GitHub
 
 FREQ is a number in MHz (2400), a value with a unit (2400MHz, 2.4GHz), or one
 of the words base, min, max. CPUS is a list such as 3, 2,3, 0-7 or all. lock,
@@ -78,8 +78,8 @@ resets at the end. Its own messages go to stderr; stdout and the exit code are
 the ones of COMMAND.
 
 lock, run, limit and reset need root. They run sudo themselves: do not start
-cpu-tune with sudo. Without a terminal (for example in scripts and AI agents)
-they use "sudo -n" and never ask for a password; "cpu-tune sudoers --install"
+cputune with sudo. Without a terminal (for example in scripts and AI agents)
+they use "sudo -n" and never ask for a password; "cputune sudoers --install"
 sets that up. Add --json to any command for machine-readable output.
 """
 
@@ -135,7 +135,7 @@ def say(text: str = "") -> None:
 
 def warn(msg: str) -> None:
     WARNINGS.append(msg)
-    print(paint(f"cpu-tune: warning: {msg}", YELLOW), file=sys.stderr)
+    print(paint(f"cputune: warning: {msg}", YELLOW), file=sys.stderr)
 
 
 def want_color(mode: str, stream) -> bool:
@@ -427,7 +427,7 @@ def load_state() -> dict:
 
 
 def state_cpus() -> list[int] | None:
-    """The CPUs that cpu-tune changed, or None when nothing is changed."""
+    """The CPUs that cputune changed, or None when nothing is changed."""
     if not STATE_FILE.exists():
         return None
     try:
@@ -652,8 +652,8 @@ def render_show(cores: list[Core], info: dict, measured: bool) -> list[str]:
         cpus = format_cpu_list(changed) if changed else "?"
         lines.append(
             paint("● ", YELLOW)
-            + f"cpu-tune changed cpu {paint(cpus, BOLD, WHITE)}. "
-            + f"Undo with: {paint('cpu-tune reset', BOLD, WHITE)}"
+            + f"cputune changed cpu {paint(cpus, BOLD, WHITE)}. "
+            + f"Undo with: {paint('cputune reset', BOLD, WHITE)}"
         )
     return lines
 
@@ -666,7 +666,7 @@ def show_json(cores: list[Core], info: dict, command: str) -> dict:
         "command": command,
         "version": __version__,
         "system": info | {"cores": len(cores), "cpus": sum(len(c.cpus) for c in cores)},
-        "changed_by_cpu_tune": None if changed is None else {"cpus": changed, "state_file": STATE_SHOWN},
+        "changed_by_cputune": None if changed is None else {"cpus": changed, "state_file": STATE_SHOWN},
         "default_lock_cpus": list(default_lock_core(cores).cpus) if freq else None,
         "cores": [c.to_json() for c in cores],
     }
@@ -714,7 +714,7 @@ class FdReader:
 
 
 def stay_away_from_benchmarks(allowed: set[int]) -> None:
-    """Run only on the allowed CPUs that cpu-tune did not lock: watch must not disturb a benchmark."""
+    """Run only on the allowed CPUs that cputune did not lock: watch must not disturb a benchmark."""
     try:
         if keep := allowed - set(state_cpus() or []):
             os.sched_setaffinity(0, keep)
@@ -819,7 +819,7 @@ def script_path() -> str:
 
 
 def root_command(argv: list[str]) -> list[str]:
-    """The command that runs cpu-tune with argv as root."""
+    """The command that runs cputune with argv as root."""
     script = script_path()
     if os.geteuid() == 0 or TEST_MODE:
         return [sys.executable, script, *argv]
@@ -830,7 +830,7 @@ def root_command(argv: list[str]) -> list[str]:
 
 
 def run_root(argv: list[str], capture: bool = False) -> subprocess.CompletedProcess:
-    """Run cpu-tune with argv as root. With capture=True, stdout is in the result."""
+    """Run cputune with argv as root. With capture=True, stdout is in the result."""
     cmd = root_command(argv)
     quiet_sudo = cmd[:2] == ["sudo", "-n"]
     sys.stdout.flush()
@@ -844,8 +844,8 @@ def run_root(argv: list[str], capture: bool = False) -> subprocess.CompletedProc
         if result.returncode != 0 and result.stderr.startswith("sudo:"):
             die(
                 f"needs root, but sudo cannot run without a password here "
-                f"({result.stderr.strip()}). Run cpu-tune in a terminal, or allow it "
-                "without a password: see 'cpu-tune sudoers'"
+                f"({result.stderr.strip()}). Run cputune in a terminal, or allow it "
+                "without a password: see 'cputune sudoers'"
             )
         sys.stderr.write(result.stderr)
     return result
@@ -885,13 +885,13 @@ def save_state(cpus: list[int], exclusive: bool) -> None:
 
     A value that is already saved is never overwritten, so a second lock keeps
     the original values. This runs before any change, so reset works also when
-    a later write fails. With exclusive=True, fail when cpu-tune already changed
-    something: then two benchmarks cannot use cpu-tune at the same time.
+    a later write fails. With exclusive=True, fail when cputune already changed
+    something: then two benchmarks cannot use cputune at the same time.
     """
     existed = STATE_FILE.exists()
     if existed and exclusive:
         cpus_text = format_cpu_list(state_cpus() or [])
-        die(f"cpu-tune already changed cpu {cpus_text}. Undo it first with: cpu-tune reset")
+        die(f"cputune already changed cpu {cpus_text}. Undo it first with: cputune reset")
     state = load_state() if existed else {"version": 1, "cpus": {}, "boost": {}}
 
     for cpu in cpus:
@@ -913,10 +913,10 @@ def save_state(cpus: list[int], exclusive: bool) -> None:
         tmp.write_text(text)
         os.replace(tmp, STATE_FILE)
         return
-    try:  # O_EXCL: when two cpu-tune processes start at the same time, only one wins.
+    try:  # O_EXCL: when two cputune processes start at the same time, only one wins.
         fd = os.open(STATE_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     except FileExistsError:
-        die("another cpu-tune changed settings at the same time. Check with: cpu-tune show")
+        die("another cputune changed settings at the same time. Check with: cputune show")
     with os.fdopen(fd, "w") as f:
         f.write(text)
 
@@ -1009,7 +1009,7 @@ def cmd_lock(args: argparse.Namespace) -> None:
         try:
             targets[cpu] = target_khz(cpu, freq, clamp=False)
         except Error as e:
-            die(f"{e} Boost is off now. Undo with: cpu-tune reset")
+            die(f"{e} Boost is off now. Undo with: cputune reset")
 
     # 3. The performance governor, so the core does not drop below the minimum.
     # 4. Minimum = maximum = target.
@@ -1044,7 +1044,7 @@ def cmd_lock(args: argparse.Namespace) -> None:
             "boost_off": scope,
             "governor": ",".join(sorted(governors)),
             "taskset": taskset,
-            "undo": "cpu-tune reset",
+            "undo": "cputune reset",
         })
         return
 
@@ -1066,12 +1066,12 @@ def cmd_lock(args: argparse.Namespace) -> None:
     say(f"  {paint('governor', GRAY)}  {','.join(sorted(governors))}")
     say()
     say(f"Run a benchmark:  {paint(taskset + ' ./bench', BOLD, WHITE)}")
-    say(f"Undo:             {paint('cpu-tune reset', BOLD, WHITE)}")
+    say(f"Undo:             {paint('cputune reset', BOLD, WHITE)}")
 
 
 def cmd_limit(args: argparse.Namespace) -> None:
     if args.min is None and args.max is None:
-        die("give --min, --max or both. Example: cpu-tune limit --max 2400")
+        die("give --min, --max or both. Example: cputune limit --max 2400")
     ensure_root(args)
     cpus = select_cpus(args.cpu, freq_cpus())
     save_state(cpus, exclusive=False)
@@ -1084,7 +1084,7 @@ def cmd_limit(args: argparse.Namespace) -> None:
         ranges.append({"cpu": cpu, "min_mhz": new_min // 1000, "max_mhz": new_max // 1000})
 
     if args.json:
-        print_json({"ok": True, "command": "limit", "cpus": cpus, "ranges": ranges, "undo": "cpu-tune reset"})
+        print_json({"ok": True, "command": "limit", "cpus": cpus, "ranges": ranges, "undo": "cputune reset"})
         return
     say("\n".join(render_show(get_cores(), system_info(), False)))
 
@@ -1141,7 +1141,7 @@ def cmd_reset(args: argparse.Namespace) -> None:
 
 def cmd_run(args: argparse.Namespace) -> None:
     if not args.command:
-        die("give the command after --. Example: cpu-tune run -- ./bench")
+        die("give the command after --. Example: cputune run -- ./bench")
     lock = ["lock", "--exclusive", "--json", f"--color={'always' if COLOR else 'never'}"]
     if args.freq is not None:
         lock.append(str(args.freq))
@@ -1164,7 +1164,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     measured = ",".join(str(c["measured_mhz"]) for c in locked["cores"])
     if not args.json:
         say(
-            paint("cpu-tune: ", GRAY)
+            paint("cputune: ", GRAY)
             + f"locked cpu {paint(format_cpu_list(cpus), BOLD, WHITE)} at {paint(mhz + ' MHz', BOLD, MAGENTA)}"
             + paint(f" (measured {measured} MHz), running: {' '.join(args.command)}", GRAY)
         )
@@ -1181,7 +1181,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         except OSError as e:
             if not TEST_MODE:
                 die(f"cannot pin to cpu {format_cpu_list(cpus)}: {e.strerror}")
-        env = dict(os.environ, CPU_TUNE_CPUS=format_cpu_list(cpus))
+        env = dict(os.environ, CPUTUNE_CPUS=format_cpu_list(cpus))
         try:
             returncode = subprocess.call(args.command, env=env)
         except OSError as e:
@@ -1192,9 +1192,9 @@ def cmd_run(args: argparse.Namespace) -> None:
         except Error as e:
             reset = subprocess.CompletedProcess([], 1, str(e))
         if reset.returncode != 0:
-            warn(f"reset failed. Undo by hand with: cpu-tune reset\n{reset.stdout.strip()}")
+            warn(f"reset failed. Undo by hand with: cputune reset\n{reset.stdout.strip()}")
         elif not args.json:
-            say(paint("cpu-tune: ", GRAY) + f"reset done. The command exited with {returncode}.")
+            say(paint("cputune: ", GRAY) + f"reset done. The command exited with {returncode}.")
 
     if args.json:
         print_json({
@@ -1207,7 +1207,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     sys.exit(returncode)
 
 
-SUDOERS_FILE = "/etc/sudoers.d/cpu-tune"
+SUDOERS_FILE = "/etc/sudoers.d/cputune"
 
 
 def owned_by_root(path: Path) -> bool:
@@ -1244,10 +1244,10 @@ def sudo_works(path: Path) -> bool | None:
 
 
 def self_command() -> str:
-    """How the user calls this script: "cpu-tune" when the shell finds this file, else its path."""
-    found = shutil.which("cpu-tune")
+    """How the user calls this script: "cputune" when the shell finds this file, else its path."""
+    found = shutil.which("cputune")
     if found and Path(found).resolve() == Path(script_path()).resolve():
-        return "cpu-tune"
+        return "cputune"
     return shlex.quote(script_path())
 
 
@@ -1255,7 +1255,7 @@ def sudoers_status() -> dict:
     """What is set up. target is the copy that the rule names: always one that only root can change."""
     user = pwd.getpwuid(os.getuid()).pw_name  # not $USER: the environment can name anyone
     script = Path(script_path())
-    target = script if owned_by_root(script) else SYSTEM_BIN / "cpu-tune"
+    target = script if owned_by_root(script) else SYSTEM_BIN / "cputune"
     installed = owned_by_root(target)
     return {
         "user": user,
@@ -1275,7 +1275,7 @@ def render_sudoers(status: dict) -> list[str]:
     lines = [
         "lock, run, limit and reset need root. In a terminal, sudo asks for your password.",
         "Scripts and AI agents have no terminal: they need a sudo rule that lets them run",
-        "cpu-tune as root without a password.",
+        "cputune as root without a password.",
         "",
         f"  {ok if status['installed'] else bad} {path} "
         + ("is owned by root" if status["installed"] else "is not installed where only root can change it"),
@@ -1287,7 +1287,7 @@ def render_sudoers(status: dict) -> list[str]:
     if status["works"]:
         lines.append(paint("Everything is set up.", BOLD, GREEN))
     else:
-        does = [] if status["installed"] else [f"install cpu-tune to {status['path']}, owned by root"]
+        does = [] if status["installed"] else [f"install cputune to {status['path']}, owned by root"]
         does += [f"add this rule to {status['file']}, after visudo checked it:", "  " + status["rule"]]
         lines += [
             "Set it up with one command:",
@@ -1299,7 +1299,7 @@ def render_sudoers(status: dict) -> list[str]:
     lines += [
         "",
         paint("The rule names a copy that only root can change. Otherwise every program that", GRAY),
-        paint("runs as you could change cpu-tune, and so run anything as root.", GRAY),
+        paint("runs as you could change cputune, and so run anything as root.", GRAY),
         paint(f"Undo: {status['undo']}", GRAY),
     ]
     return lines
@@ -1310,11 +1310,11 @@ def sudoers_install(status: dict) -> list[str]:
     done = []
     if not status["installed"]:
         target, version, origin = install_copy(system=True, no_check=False)
-        done.append(f"Installed cpu-tune {version} from {origin} to {target}")
+        done.append(f"Installed cputune {version} from {origin} to {target}")
     rule = f"# {SUDOERS_FILE}: {status['user']} can run {status['path']} as root without a password.\n"
     rule += status["rule"] + "\n"
     if not TEST_MODE:
-        fd, name = tempfile.mkstemp(prefix="cpu-tune.sudoers.")
+        fd, name = tempfile.mkstemp(prefix="cputune.sudoers.")
         with os.fdopen(fd, "w") as f:
             f.write(rule)
         try:
@@ -1332,11 +1332,12 @@ def cmd_sudoers(args: argparse.Namespace) -> None:
     status = sudoers_status()
     if args.rule:
         if not status["installed"]:
-            warn(f"the rule is for {status['path']}. Install cpu-tune there first: "
+            warn(f"the rule is for {status['path']}. Install cputune there first: "
                  f"{self_command()} install --system")
         say(f"# {SUDOERS_FILE}: {status['user']} can run {status['path']} as root without a password.")
         say(status["rule"])
         return
+    legacy_note()
     if args.install:
         done = [] if status["works"] else sudoers_install(status)
         status = sudoers_status()
@@ -1363,7 +1364,7 @@ VERSION_LINE = re.compile(rb'^__version__ = "([^"]+)"', re.MULTILINE)
 
 
 def source_version(source: bytes) -> str | None:
-    """The version of a cpu-tune script, read from its text. The script is not run."""
+    """The version of a cputune script, read from its text. The script is not run."""
     m = VERSION_LINE.search(source)
     return m[1].decode() if m else None
 
@@ -1377,18 +1378,18 @@ def version_key(version: str | None) -> tuple[int, ...]:
 
 
 def check_source(source: bytes, origin: str) -> None:
-    """Make sure that source is a cpu-tune script that this Python can compile."""
+    """Make sure that source is a cputune script that this Python can compile."""
     if not source.startswith(b"#!/usr/bin/env python3\n") or source_version(source) is None:
-        die(f"{origin} is not a cpu-tune script")
+        die(f"{origin} is not a cputune script")
     try:
-        compile(source, "cpu-tune", "exec")
+        compile(source, "cputune", "exec")
     except (SyntaxError, ValueError) as e:
         die(f"{origin} does not compile with Python {sys.version.split()[0]}: {e}")
 
 
 def download() -> bytes:
-    """The newest cpu-tune from GitHub. Tests can use another URL."""
-    url = os.environ.get("CPU_TUNE_SOURCE_URL", SOURCE_URL) if TEST_MODE else SOURCE_URL
+    """The newest cputune from GitHub. Tests can use another URL."""
+    url = os.environ.get("CPUTUNE_SOURCE_URL", SOURCE_URL) if TEST_MODE else SOURCE_URL
     try:
         with urllib.request.urlopen(url, timeout=30) as response:
             source = response.read(10_000_000)
@@ -1430,13 +1431,13 @@ def in_git_checkout(path: Path) -> bool:
 
 
 def path_note(target: Path) -> None:
-    """Warn when the shell does not find target as "cpu-tune"."""
+    """Warn when the shell does not find target as "cputune"."""
     if TEST_MODE:
         return
     folders = [Path(p) for p in os.environ.get("PATH", "").split(os.pathsep) if p]
     if target.parent not in folders:
         warn(f"{target.parent} is not in your PATH. Add it, or call {target} directly.")
-    elif (found := shutil.which("cpu-tune")) and Path(found) != target:
+    elif (found := shutil.which("cputune")) and Path(found) != target:
         warn(f"your shell finds {found} first. Delete it, or call {target} directly.")
 
 
@@ -1446,9 +1447,9 @@ def sudo_prefix() -> list[str]:
 
 
 def sudo_install(source: bytes, target: Path, mode: str) -> None:
-    """Install source as target, owned by root. Uses plain sudo, never the cpu-tune rule:
+    """Install source as target, owned by root. Uses plain sudo, never the cputune rule:
     the rule must never let a user install a file of their choice as root."""
-    fd, name = tempfile.mkstemp(prefix="cpu-tune.")
+    fd, name = tempfile.mkstemp(prefix="cputune.")
     tmp = Path(name)
     with os.fdopen(fd, "wb") as f:
         f.write(source)
@@ -1480,7 +1481,7 @@ def install_copy(system: bool, no_check: bool) -> tuple[Path, str | None, str]:
             if local is None or version_key(source_version(remote)) > version_key(source_version(local)):
                 source, origin = remote, "GitHub"
     assert source is not None
-    target = (SYSTEM_BIN if system else USER_BIN) / "cpu-tune"
+    target = (SYSTEM_BIN if system else USER_BIN) / "cputune"
     if target.is_file() and not target.is_symlink() and target.read_bytes() == source:
         pass  # nothing to do
     elif system and os.geteuid() != 0:
@@ -1491,20 +1492,30 @@ def install_copy(system: bool, no_check: bool) -> tuple[Path, str | None, str]:
     return target, source_version(source), origin
 
 
+def legacy_note() -> None:
+    """Version 2.0.0 renamed cpu-tune to cputune. Old copies do not update any more, and
+    version 1.0.0 lets "sudo cpu-tune run" start any program: they must go, with their rule."""
+    old = [str(p) for p in (USER_BIN / "cpu-tune", SYSTEM_BIN / "cpu-tune") if p.exists()]
+    if old:
+        warn(f"cpu-tune is called cputune now. Delete the old copies and the old sudo rule: "
+             f"sudo rm -f {' '.join(old)} /etc/sudoers.d/cpu-tune")
+
+
 def cmd_install(args: argparse.Namespace) -> None:
     target, version, origin = install_copy(args.system, args.no_check)
+    path_note(target)  # before the output, so that --json has the warnings
+    legacy_note()
     if args.json:
         print_json({"ok": True, "command": "install", "path": str(target), "version": version, "source": origin})
     else:
         where = paint(str(target), BOLD, WHITE)
-        say(paint("✓ ", BOLD, GREEN) + f"Installed cpu-tune {version} from {origin} to {where}")
-    path_note(target)
+        say(paint("✓ ", BOLD, GREEN) + f"Installed cputune {version} from {origin} to {where}")
 
 
 def cmd_update(args: argparse.Namespace) -> None:
     path = Path(script_path()).resolve()
     if not path.is_file():
-        die("cpu-tune does not run from a file. Install it with: cpu-tune install")
+        die("cputune does not run from a file. Install it with: cputune install")
     if in_git_checkout(path):
         die(f"{path} is in a git checkout. Update it with: git pull")
     if not (os.access(path, os.W_OK) and os.access(path.parent, os.W_OK)):
@@ -1521,9 +1532,9 @@ def cmd_update(args: argparse.Namespace) -> None:
         print_json({"ok": True, "command": "update", "path": str(path), "old_version": old,
                     "new_version": new, "updated": updated})
     elif updated:
-        say(paint("✓ ", BOLD, GREEN) + f"Updated {path}: cpu-tune {old} -> {paint(new or '?', BOLD, WHITE)}")
+        say(paint("✓ ", BOLD, GREEN) + f"Updated {path}: cputune {old} -> {paint(new or '?', BOLD, WHITE)}")
     else:
-        say(paint("✓ ", BOLD, GREEN) + f"cpu-tune {old} is up to date (GitHub has {new}).")
+        say(paint("✓ ", BOLD, GREEN) + f"cputune {old} is up to date (GitHub has {new}).")
 
 
 # ------------------------------------------------------------------ main
@@ -1537,10 +1548,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="use colors (default: auto)")
 
     parser = argparse.ArgumentParser(
-        prog="cpu-tune", description=HELP, parents=[common],
+        prog="cputune", description=HELP, parents=[common],
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--version", action="version", version=f"cpu-tune {__version__}")
+    parser.add_argument("--version", action="version", version=f"cputune {__version__}")
     sub = parser.add_subparsers(title="commands", metavar="COMMAND")
     cpu_help = "CPUs (default: the best-ranked core without CPU 0)"
 
@@ -1557,11 +1568,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("freq", nargs="?", type=parse_freq, metavar="FREQ", help="frequency (default: base)")
     p.add_argument("--cpu", metavar="CPUS", help=cpu_help)
     p.add_argument("--exclusive", action="store_true",
-                   help="fail when cpu-tune already changed settings")
+                   help="fail when cputune already changed settings")
     p.set_defaults(func=cmd_lock)
 
     p = sub.add_parser("run", parents=[common], help="lock, run a command on the locked core, reset",
-                       usage="cpu-tune run [FREQ] [--cpu CPUS] -- COMMAND [ARG ...]")
+                       usage="cputune run [FREQ] [--cpu CPUS] -- COMMAND [ARG ...]")
     p.add_argument("freq", nargs="?", type=parse_freq, metavar="FREQ", help="frequency (default: base)")
     p.add_argument("--cpu", metavar="CPUS", help=cpu_help)
     p.set_defaults(func=cmd_run)
@@ -1575,8 +1586,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("reset", parents=[common], help="undo all changes of lock, run and limit")
     p.set_defaults(func=cmd_reset)
 
-    p = sub.add_parser("sudoers", parents=[common], help="show how to run cpu-tune without a password prompt")
-    p.add_argument("--install", action="store_true", help="set it up: install the rule (and cpu-tune, if needed)")
+    p = sub.add_parser("sudoers", parents=[common], help="show how to run cputune without a password prompt")
+    p.add_argument("--install", action="store_true", help="set it up: install the rule (and cputune, if needed)")
     p.add_argument("--rule", action="store_true", help="print only the sudo rule")
     p.set_defaults(func=cmd_sudoers)
 
@@ -1594,7 +1605,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def with_default_command(argv: list[str]) -> list[str]:
-    """No command given: use "show". "cpu-tune --json" is "cpu-tune show --json"."""
+    """No command given: use "show". "cputune --json" is "cputune show --json"."""
     if any(a in ("-h", "--help", "--version") or a in COMMANDS for a in argv):
         return argv
     expect_value = False
@@ -1625,9 +1636,9 @@ def main() -> int:
     args.argv = [*argv, f"--color={'always' if COLOR else 'never'}"]  # for the run as root
     name = args.func.__name__[len("cmd_"):]
     if command and args.func is not cmd_run:
-        build_parser().error("'-- COMMAND' is only for: cpu-tune run [FREQ] [--cpu CPUS] -- COMMAND")
+        build_parser().error("'-- COMMAND' is only for: cputune run [FREQ] [--cpu CPUS] -- COMMAND")
     if UNDER_SUDO and name not in SUDO_COMMANDS:
-        print(f"cpu-tune: error: do not start 'cpu-tune {name}' with sudo. cpu-tune runs sudo "
+        print(f"cputune: error: do not start 'cputune {name}' with sudo. cputune runs sudo "
               f"itself when it needs root. Under sudo, only these commands work: {', '.join(SUDO_COMMANDS)}",
               file=sys.stderr)
         return 1
@@ -1637,7 +1648,7 @@ def main() -> int:
     except Error as e:
         if args.json:
             print_json({"ok": False, "command": name, "error": str(e)})
-        print(paint(f"cpu-tune: error: {e}", BOLD, RED), file=sys.stderr)
+        print(paint(f"cputune: error: {e}", BOLD, RED), file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         return 130

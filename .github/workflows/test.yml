@@ -46,9 +46,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          version=$(sed -n 's/^__version__ = "\([^"]*\)".*/\1/p' cpu-tune)
+          version=$(sed -n 's/^__version__ = "\([^"]*\)".*/\1/p' cputune)
           if [ -z "$version" ]; then
-            echo "cpu-tune has no __version__ line"
+            echo "cputune has no __version__ line"
             exit 1
           fi
           tag="v$version"
@@ -57,7 +57,7 @@ jobs:
             exit 0
           fi
           if git rev-parse -q --verify "refs/tags/$tag" > /dev/null; then
-            echo "$tag exists without a release: release the cpu-tune of the tag"
-            git show "$tag:cpu-tune" > cpu-tune
+            echo "$tag exists without a release: release the cputune of the tag"
+            git show "$tag:cputune" > cputune
           fi
-          gh release create "$tag" cpu-tune --target "$GITHUB_SHA" --title "cpu-tune $version" --generate-notes
+          gh release create "$tag" cputune --target "$GITHUB_SHA" --title "cputune $version" --generate-notes
