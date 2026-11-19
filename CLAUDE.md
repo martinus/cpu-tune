@@ -35,7 +35,8 @@ shellcheck examples/*.sh
   `unittest.mock`, see `SecurityTest`. Stub the `cmd_*` functions there: under simulated sudo the
   hooks are off, so a real command would change this machine.
 - Tests must not depend on git: CI containers have no git, so the checkout has no `.git`.
-- Keep tests fast: CI waits for them. Fake trees go to `/dev/shm` (8 times faster than disk). No
+- Keep tests fast: CI waits for them. Fake trees go to `/dev/shm` (8 times faster than disk; Docker
+  mounts it noexec, so a test that runs files of its tree sets `tmp = None`, see `RootCopyTest`). No
   `sleep` in tests: under `CPUTUNE_ROOT`, cputune does not wait. Tests run in parallel, so a test
   must not change files outside its own tree.
 - Tests also pass as root (the CI containers run as root). A test that needs a copy not owned by

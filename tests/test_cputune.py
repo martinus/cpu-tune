@@ -29,6 +29,7 @@ import fake_sysfs  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parent.parent / "cputune"
 # Fake trees in memory when possible: a test builds hundreds of small files, 8 times faster there.
+# Docker mounts /dev/shm noexec: a test that runs files of its tree sets tmp = None (disk).
 TMP = "/dev/shm" if os.access("/dev/shm", os.W_OK) else None
 
 
@@ -42,9 +43,10 @@ def fake_sysfs_cpus(text: str) -> list[int]:
 
 class Case(unittest.TestCase):
     machine = "intel-i9-13950hx"
+    tmp = TMP
 
     def setUp(self) -> None:
-        self.root = Path(tempfile.mkdtemp(prefix="cputune-test-", dir=TMP))
+        self.root = Path(tempfile.mkdtemp(prefix="cputune-test-", dir=self.tmp))
         self.addCleanup(shutil.rmtree, self.root)
         fake_sysfs.build(self.root, self.machine)
         self.cpu = self.root / "sys/devices/system/cpu"
@@ -897,6 +899,8 @@ class SudoersTest(Case):
 class RootCopyTest(Case):
     """With a sudo rule, root must run the root-owned /usr/local/bin/cputune, whichever copy the
     user started: the rule names only that copy, and root must not run a copy the user can change."""
+
+    tmp = None  # root_command checks that the copies are executable: not on a noexec /dev/shm
 
     def setUp(self) -> None:
         super().setUp()
