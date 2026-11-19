@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
-__version__ = "2.4.0"  # increase it for every change: "cputune update" compares versions
+__version__ = "2.4.1"  # increase it for every change: "cputune update" compares versions
 
 # The latest release, not main: raw.githubusercontent.com caches main for 5 minutes, and a
 # release exists only after the tests passed on main.
@@ -80,24 +80,40 @@ change settings by hand:
 install and update:
   cputune install               install the newest release, or update to it
   cputune install --system      the same, in /usr/local/bin, owned by root
-  cputune install --no-password lock, run, limit and reset without a password:
+  cputune install --no-password
+                                lock, run, limit and reset without a password:
                                 for scripts and AI agents (adds a sudo rule)
 
-FREQ is a number in MHz (2400), a value with a unit (2400MHz, 2.4GHz), or one
-of the words base, min, max. CPUS is a list such as 3, 2,3, 0-7 or all. lock,
-run and limit always include the SMT siblings of each CPU. With amd-pstate,
-lock min is amd_pstate_lowest_nonlinear_freq: the CPU does not go lower.
+all commands and their options:
+  cputune [show] [--watch] [--interval S] [--count N] [--now]
+  cputune run [FREQ] [--cpu CPUS] [--strict] -- COMMAND [ARG ...]
+  cputune lock [FREQ] [--cpu CPUS] [--exclusive]
+  cputune limit [--min FREQ] [--max FREQ] [--cpu CPUS]
+  cputune reset
+  cputune install [--system] [--no-password] [--no-check]
+  Each command also takes --json, --color {auto,always,never} and --help.
+  Short forms: -w is --watch, -c is --cpu, -h is --help.
 
-run executes COMMAND as your user, pinned to CPUS (as taskset -c CPUS; without
---cpu: all CPUs of the locked core), and always resets at the end. Its own
-messages go to stderr; stdout and the exit code are the ones of COMMAND. run
-measures the frequency while COMMAND runs, and warns when the result can vary;
-then its JSON has "stable": false.
+values:
+  FREQ                          MHz (2400), with a unit (2400MHz, 2.4GHz), or
+                                base, min, max. With amd-pstate, lock min is
+                                amd_pstate_lowest_nonlinear_freq: the CPU does
+                                not go lower.
+  CPUS                          a list such as 3, 2,3, 0-7 or all. lock, run
+                                and limit always add the SMT siblings.
 
-lock, run, limit and reset need root. They run sudo themselves: do not start
-cputune with sudo. Without a terminal (for example in scripts and AI agents)
-they use "sudo -n" and never ask for a password. Add --json to any command for
-machine-readable output. "cputune COMMAND --help" shows all options of a command.
+how run and sudo work:
+  run executes COMMAND as your user, pinned to CPUS (as taskset -c CPUS), and
+  always resets at the end. Its own messages go to stderr; stdout and the exit
+  code are the ones of COMMAND. It measures the frequency while COMMAND runs,
+  and warns when the result can vary: then its JSON has "stable": false.
+
+  lock, run, limit and reset need root, and they run sudo themselves: do not
+  start them with sudo. Without a terminal (scripts, AI agents) they use
+  "sudo -n" and never ask for a password.
+
+  Add --json to any command for machine-readable output.
+  "cputune COMMAND --help" shows all options of a command.
 """
 
 

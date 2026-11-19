@@ -235,8 +235,13 @@ class ShowTest(Case):
         self.assertIn("cputune install --no-password", text)
         self.assertTrue(self.ok("install", "--help").stdout.startswith("usage: cputune install "))
 
+    def test_help_names_all_options(self) -> None:
+        text = self.ok("--help").stdout
+        for command in ("show", "run", "lock", "limit", "reset", "install"):
+            options = set(re.findall(r"(?<![\w-])--[a-z][a-z-]*", self.ok(command, "--help").stdout))
+            for option in options:
+                self.assertIn(option, text, command)
 
-class LockTest(Case):
     def test_lock_default_intel(self) -> None:
         before = self.snapshot()
         data = self.json("lock")
