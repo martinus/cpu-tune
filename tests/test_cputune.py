@@ -126,6 +126,49 @@ class ShowTest(Case):
         self.assertEqual(cores[(8, 9)]["base_mhz"], 2200)  # Intel base_frequency, P-core
         self.assertEqual(cores[(16,)]["base_mhz"], 1600)  # E-core
 
+    def test_show_starts_without_slow_imports(self) -> None:
+        # Show and watch run often and next to benchmarks: they must not load what only run,
+        # lock and install need. -X importtime lists each module that Python loads.
+        def loaded(*args: str) -> set[str]:
+            env = dict(os.environ, CPUTUNE_ROOT=str(self.root))
+            result = subprocess.run([sys.executable, "-X", "importtime", *args], env=env, capture_output=True,
+                                    text=True, timeout=60)
+            return {line.rsplit("|", 1)[-1].strip() for line in result.stderr.splitlines()}
+
+        # What Python loads anyway for the same top-level imports and an argparse parser (3.9 loads
+        # threading, 3.14 dataclasses): not the fault of cputune.
+        base = loaded("-c", "import argparse, json, math, os, pwd, re, shutil, sys, textwrap, time, pathlib\n"
+                            "p = argparse.ArgumentParser(); p.add_argument('--x'); p.parse_args([])")
+        extra = loaded(str(SCRIPT)) - base
+        for module in ("subprocess", "threading", "signal", "tempfile", "shlex", "dataclasses", "typing"):
+            self.assertNotIn(module, extra)
+
+    def test_one_rule_for_the_current_frequency(self) -> None:
+        with mock.patch.dict(os.environ, CPUTUNE_ROOT=str(self.root)):
+            m = load_module()
+        avg = self.cpu / "cpu8/cpufreq/cpuinfo_avg_freq"  # scaling_cur_freq is 3100000 in the fake tree
+        self.assertEqual((m.cpu_khz(8), m.cpu_khz(8, busy_only=True)), (3100000, 3100000))  # old kernel
+        avg.write_text("4200000\n")
+        self.assertEqual((m.cpu_khz(8), m.cpu_khz(8, busy_only=True)), (4200000, 4200000))
+        avg.write_text("")  # a sleeping CPU: the file has no value
+        self.assertEqual((m.cpu_khz(8), m.cpu_khz(8, busy_only=True)), (3100000, None))
+        reader = m.FdReader()
+        self.assertEqual(m.cpu_khz(8, reader.int), 3100000)
+        # watch shows the sleeping core with scaling_cur_freq, not as "no value"
+        avg.unlink()
+        data = json.loads(self.ok("-w", "--count", "1", "--json").stdout)
+        self.assertEqual(next(c for c in data["cores"] if c["cpus"] == [8, 9])["now_mhz"], 3100)
+
+    def test_fd_reader_opens_a_missing_file_once(self) -> None:
+        with mock.patch.dict(os.environ, CPUTUNE_ROOT=str(self.root)):
+            m = load_module()
+        reader, missing = m.FdReader(), self.cpu / "cpu8/cpufreq/cpuinfo_avg_freq"
+        with mock.patch("os.open", side_effect=FileNotFoundError) as opened:
+            self.assertIsNone(reader.int(missing))
+            self.assertIsNone(reader.int(missing))
+        self.assertEqual(opened.call_count, 1)  # watch reads it in every frame: no open() each time
+        reader.close()
+
     def test_measure_skips_failed_reads(self) -> None:
         with mock.patch.dict(os.environ, CPUTUNE_ROOT=str(self.root)):
             m = load_module()
@@ -643,6 +686,7 @@ class RunTest(Case):
     def run_json(self, *args: str, code: int = 0) -> dict:
         result = self.run_tool("run", "--json", *args)
         self.assertEqual(result.returncode, code, result.stderr)
+        self.assertNotIn("cputune: locked cpu", result.stderr)  # --json: no text for people
         return json.loads(result.stderr[result.stderr.index("{"):])  # stdout belongs to the command
 
     def test_measures_while_the_command_runs(self) -> None:
@@ -1019,6 +1063,8 @@ class SudoersTest(Case):
         self.assertTrue(lines[0].startswith("# /etc/sudoers.d/cputune"))
         self.assertTrue(lines[1].endswith(f"NOPASSWD: {self.root / 'usr/local/bin/cputune'}"))
         self.assertIn("install --system", result.stderr)
+        # --json: the rule is the result, so it prints also then
+        self.assertEqual(self.ok("sudoers", "--rule", "--json").stdout, result.stdout)
 
     def test_guide_for_a_copy_owned_by_root(self) -> None:
         m = load_module()
@@ -1096,6 +1142,19 @@ class RootCopyTest(Case):
         with self.root_owned(self.system):
             self.assertEqual(self.m.root_command(["lock"]), ["sudo", "-n", str(self.system), "lock"])
         self.assertEqual(self.m.WARNINGS, [])
+
+    def test_sudo_runs_the_copy_that_the_rule_names(self) -> None:
+        # One decision (trusted_copy) for both: the rule must never name a copy that sudo does not run.
+        for owned in ((), (self.system,), (self.mine,), (self.mine, self.system)):
+            with self.subTest(owned=owned), self.root_owned(*owned), contextlib.redirect_stderr(io.StringIO()), \
+                    mock.patch.object(self.m, "sudo_works", lambda p: None):
+                status, copy = self.m.sudoers_status(), self.m.root_copy()
+                if status["installed"]:
+                    self.assertEqual(copy, status["path"])
+                    self.assertIn(Path(copy), owned)  # root runs only a copy that only root can change
+                else:  # no such copy: sudo runs this file and asks for a password, no rule names it
+                    self.assertEqual(copy, str(self.mine))
+                    self.assertEqual(status["path"], str(self.system))
 
     def test_without_root_owned_copy_sudo_runs_this_copy(self) -> None:
         with self.root_owned():

@@ -64,6 +64,12 @@ shellcheck examples/*.sh
 - Few commands: show (`cputune`, `-w` live), run, lock, limit, reset, install. `cputune --help`
   groups them by task (`HELP`); argparse lists none. `watch`, `check`, `update` and `sudoers` are
   hidden aliases (no `help=`): scripts keep working, and root needs `update` for its own copy.
+- One place for each decision: `trusted_copy` (the copy that root runs and the rule names),
+  `cpu_khz` (the current frequency), `select_cpus` (default: the best core), `tolerance_mhz`.
+  Output: `say` (nothing with `--json`), `print_json` (adds `ok` and `command`), set once in `main`.
+- Start time: show and watch must not import `subprocess`, `threading`, `signal`, `tempfile`,
+  `shlex`, `dataclasses` or `typing`: import them in the functions that need them
+  (`test_show_starts_without_slow_imports`).
 - Security: a sudo rule lets every program of the user run `cputune` as root. Under sudo only
   `lock`, `limit`, `reset` and `update` run (`SUDO_COMMANDS`), the test hooks are off, and no root
   code may run a program or write a file that the user chooses. When a root-owned
