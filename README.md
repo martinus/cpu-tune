@@ -11,7 +11,7 @@ Rank the CPU cores by speed, lock one at a fixed frequency, and run your benchma
 ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
 [![license](https://img.shields.io/badge/license-0BSD-lightgrey)](LICENSE)
 
-<img src="docs/show.png" alt="cputune on a Ryzen 9 7950X, with load on three cores" width="820">
+<img src="docs/show.png" alt="cputune --now on a Ryzen 9 7950X, with load on three cores" width="820">
 
 </div>
 

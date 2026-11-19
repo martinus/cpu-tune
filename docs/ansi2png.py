@@ -3,7 +3,7 @@
 Makes docs/show.png:
 
     for c in 1 3 5; do timeout 3 taskset -c $c python3 -c 'while 1: pass' & done; sleep 0.5
-    COLUMNS=104 ./cputune show --now --color always > /tmp/show.ansi; wait
+    COLUMNS=104 ./cputune --now --color always > /tmp/show.ansi; wait
     python3 docs/ansi2png.py /tmp/show.ansi docs/show.png 940
 
 Needs google-chrome (or chromium) in PATH.
