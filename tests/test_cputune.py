@@ -180,6 +180,33 @@ class ShowTest(Case):
         with mock.patch.object(m, "read_int", lambda path: None):
             self.assertEqual(m.measure([8]), {8: 0})
 
+    def legend(self, color: str, columns: int = 100) -> tuple[str, list[str]]:
+        """The text above the legend of show, and the lines of the legend."""
+        lines = self.run_tool("show", "--color", color, columns=columns).stdout.splitlines()
+        start = next(i for i, line in enumerate(lines) if "min to " in line)
+        end = next(i for i, line in enumerate(lines) if "all values in MHz" in line)
+        return "\n".join(lines[:start]), lines[start:end + 1]
+
+    def test_legend_fits_the_terminal(self) -> None:
+        for columns in (40, 60, 70, 200):  # 70: the first three marks fill exactly 70 columns
+            with self.subTest(columns=columns):
+                legend = self.legend("never", columns)[1]
+                self.assertTrue(all(len(line) < columns for line in legend), legend)
+                self.assertEqual(len(legend) == 1, columns == 200)
+                self.assertTrue(any("★ best core: lock and run use it" in line for line in legend))  # not split
+
+    def test_legend_marks_have_the_chart_colors(self) -> None:
+        # ━ and ╍ look alike: only the color tells base range and boost apart, also in the legend.
+        chart, legend = self.legend("always")
+        legend = "\n".join(legend)
+        colors = {}
+        for mark in ("━", "╍"):
+            found = re.search(rf"\033\[([0-9;]+)m{mark}", legend)
+            self.assertIsNotNone(found, f"{mark} has no color in the legend: {legend!r}")
+            colors[mark] = found[1]
+            self.assertIn(f"\033[{found[1]}m{mark}", chart)  # the same color as in the chart
+        self.assertNotEqual(colors["━"], colors["╍"])
+
     def test_now_and_widths(self) -> None:
         for columns in (40, 80, 250):
             result = self.run_tool("show", "--now", "--color", "always", columns=columns)

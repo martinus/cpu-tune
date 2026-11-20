@@ -15,7 +15,8 @@ agents that run benchmarks (`cputune run -- <cmd>`, `--json`).
   reset and run on the real machine, with sudo; Martin runs it, CI cannot.
 - `.github/workflows/test.yml`: tests (python:3.9-slim and 3.14-slim containers; setup-python has
   no 3.9 on new runners), `version` (PRs), `release` (main).
-- `docs/show.png`: README screenshot; `docs/ansi2png.py` makes it (usage in its docstring).
+- `docs/show.png`: README screenshot. `python3 docs/screenshot.py` makes it on the current machine
+  (cputune --now with load on 3 CPUs, then `docs/ansi2png.py`; needs Chrome).
 
 ## Checks
 
