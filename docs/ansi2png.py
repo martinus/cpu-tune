@@ -1,12 +1,9 @@
 """Render colored terminal output (ANSI, 256 colors) to a PNG with headless Chrome.
 
-Makes docs/show.png:
+    python3 docs/ansi2png.py IN.ansi OUT.png [WIDTH]
 
-    for c in 1 3 5; do timeout 3 taskset -c $c python3 -c 'while 1: pass' & done; sleep 0.5
-    COLUMNS=104 ./cputune --now --color always > /tmp/show.ansi; wait
-    python3 docs/ansi2png.py /tmp/show.ansi docs/show.png 940
-
-Needs google-chrome (or chromium) in PATH.
+To make docs/show.png on this machine, use docs/screenshot.py: it runs cputune, then this.
+Needs google-chrome or chromium in PATH.
 """
 
 import html
@@ -52,23 +49,34 @@ def to_html(text: str) -> str:
     return "".join(out)
 
 
-def main() -> None:
-    src, dst = Path(sys.argv[1]), Path(sys.argv[2]).resolve()
-    width = int(sys.argv[3]) if len(sys.argv) > 3 else 1000
-    text = src.read_text()
+def find_chrome() -> str:
+    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+        if path := shutil.which(name):
+            return path
+    sys.exit("needs google-chrome or chromium in PATH")
+
+
+def render(text: str, dst: Path, width: int = 1000, scale: int = 1) -> None:
+    """Write text (with ANSI colors) as a PNG. width is in CSS pixels; scale 2 doubles the pixels."""
     page = (
         '<html><body style="margin:0;background:#1e1e2e;color:#cdd6f4"><pre style="'
         "font-family:'Hack Nerd Font Mono','DejaVu Sans Mono',monospace;font-size:14px;"
         f'line-height:1.12;padding:16px 20px;margin:0">{to_html(text)}</pre></body></html>'
     )
-    chrome = shutil.which("google-chrome") or shutil.which("chromium") or "google-chrome"
+    chrome = find_chrome()
     with tempfile.NamedTemporaryFile("w", suffix=".html") as f:
         f.write(page)
         f.flush()
         height = int((text.count("\n") + 1) * 15.7 + 34)
         subprocess.run([chrome, "--headless", "--disable-gpu", "--hide-scrollbars", f"--window-size={width},{height}",
-                        "--force-device-scale-factor=1", f"--screenshot={dst}", f"file://{f.name}"],
+                        f"--force-device-scale-factor={scale}", f"--screenshot={dst.resolve()}", f"file://{f.name}"],
                        check=True, capture_output=True)
+
+
+def main() -> None:
+    src, dst = Path(sys.argv[1]), Path(sys.argv[2])
+    width = int(sys.argv[3]) if len(sys.argv) > 3 else 1000
+    render(src.read_text(), dst, width)
 
 
 if __name__ == "__main__":
