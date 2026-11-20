@@ -3,7 +3,7 @@
     python3 docs/ansi2png.py IN.ansi OUT.png [WIDTH]
 
 To make docs/show.png on this machine, use docs/screenshot.py: it runs cputune, then this.
-Needs google-chrome or chromium in PATH.
+Needs Chrome or Chromium: in PATH, or as flatpak (com.google.Chrome, org.chromium.Chromium).
 """
 
 import html
@@ -49,34 +49,52 @@ def to_html(text: str) -> str:
     return "".join(out)
 
 
-def find_chrome() -> str:
-    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+CHROME_PROGRAMS = ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser")
+CHROME_FLATPAKS = ("com.google.Chrome", "org.chromium.Chromium")
+
+
+def find_chrome() -> list[str]:
+    """The command that starts Chrome: a program in PATH, else a flatpak app ("flatpak run APP")."""
+    for name in CHROME_PROGRAMS:
         if path := shutil.which(name):
-            return path
-    sys.exit("needs google-chrome or chromium in PATH")
+            return [path]
+    if shutil.which("flatpak"):
+        for app in CHROME_FLATPAKS:
+            if subprocess.run(["flatpak", "info", app], capture_output=True).returncode == 0:
+                return ["flatpak", "run", app]
+    sys.exit(f"needs Chrome or Chromium: {' or '.join(CHROME_PROGRAMS)} in PATH, "
+             f"or the flatpak {' or '.join(CHROME_FLATPAKS)}")
 
 
 def render(text: str, dst: Path, width: int = 1000, scale: int = 1) -> None:
     """Write text (with ANSI colors) as a PNG. width is in CSS pixels; scale 2 doubles the pixels."""
     page = (
-        '<html><body style="margin:0;background:#1e1e2e;color:#cdd6f4"><pre style="'
+        '<html><head><meta charset="utf-8"></head><body style="margin:0;background:#1e1e2e;color:#cdd6f4"><pre style="'
         "font-family:'Hack Nerd Font Mono','DejaVu Sans Mono',monospace;font-size:14px;"
         f'line-height:1.12;padding:16px 20px;margin:0">{to_html(text)}</pre></body></html>'
     )
     chrome = find_chrome()
-    with tempfile.NamedTemporaryFile("w", suffix=".html") as f:
-        f.write(page)
-        f.flush()
+    dst = dst.resolve()
+    # Next to dst, not in /tmp: a flatpak Chrome sees only this directory (--filesystem), and
+    # flatpak has its own /tmp.
+    with tempfile.TemporaryDirectory(dir=dst.parent, prefix=".ansi2png-") as tmp:
+        if chrome[0] == "flatpak":
+            chrome.insert(2, f"--filesystem={tmp}")
+        page_file, shot = Path(tmp) / "page.html", Path(tmp) / "shot.png"
+        page_file.write_text(page, encoding="utf-8")
         height = int((text.count("\n") + 1) * 15.7 + 34)
-        subprocess.run([chrome, "--headless", "--disable-gpu", "--hide-scrollbars", f"--window-size={width},{height}",
-                        f"--force-device-scale-factor={scale}", f"--screenshot={dst.resolve()}", f"file://{f.name}"],
-                       check=True, capture_output=True)
+        result = subprocess.run([*chrome, "--headless", "--disable-gpu", "--hide-scrollbars",
+                                 f"--window-size={width},{height}", f"--force-device-scale-factor={scale}",
+                                 f"--screenshot={shot}", page_file.as_uri()], capture_output=True, text=True)
+        if not shot.exists():
+            sys.exit(f"{' '.join(chrome)} wrote no screenshot (exit code {result.returncode}):\n{result.stderr}")
+        shutil.move(str(shot), str(dst))
 
 
 def main() -> None:
     src, dst = Path(sys.argv[1]), Path(sys.argv[2])
     width = int(sys.argv[3]) if len(sys.argv) > 3 else 1000
-    render(src.read_text(), dst, width)
+    render(src.read_text(encoding="utf-8"), dst, width)
 
 
 if __name__ == "__main__":
