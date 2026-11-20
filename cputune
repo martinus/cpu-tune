@@ -32,7 +32,7 @@ if TYPE_CHECKING:  # only for type hints: typing makes each start slower
     import threading
     from typing import NoReturn
 
-__version__ = "2.5.0"  # increase it for every change: "cputune update" compares versions
+__version__ = "2.5.1"  # increase it for every change: "cputune update" compares versions
 
 # The latest release, not main: raw.githubusercontent.com caches main for 5 minutes, and a
 # release exists only after the tests passed on main.
@@ -622,7 +622,7 @@ def render_show(cores: list[Core], info: dict, measured: bool, changed: list[int
     freq = [c for c in cores if c.has_freq]
     lines += render_table(cores, freq, measured)
     if freq:
-        lines += ["", render_legend(freq, measured)]
+        lines += ["", *render_legend(freq, measured)]
     if changed is not None:
         cpus = format_cpu_list(changed) if changed else "?"
         lines += ["", paint("● ", YELLOW) + f"cputune changed cpu {paint(cpus, BOLD, WHITE)}. "
@@ -734,19 +734,32 @@ def render_table(cores: list[Core], freq: list[Core], measured: bool) -> list[st
     return lines
 
 
-def render_legend(freq: list[Core], measured: bool) -> str:
-    """What the marks in the chart mean: only the marks that the chart shows."""
-    legend = ["━ range"]
-    if any(c.base and c.base < c.hw_max for c in freq):
-        legend.append("╍ boost")
+def render_legend(freq: list[Core], measured: bool) -> list[str]:
+    """What the marks in the chart mean: only the marks that the chart shows, in their chart colors.
+    Wrapped between the marks to the width of the terminal."""
+    boost = any(c.base and c.base < c.hw_max for c in freq)
+    marks = [("━", (BLUE,), "min to base" if boost else "min to max")]
+    if boost:
+        marks.append(("╍", (ORANGE,), "boost, above base"))
     if any(c.limited and not c.locked for c in freq):
-        legend.append("─ outside the set range")
+        marks.append(("─", (DARK,), "outside the set range"))
     if any(c.locked for c in freq):
-        legend.append("◆ locked")
+        marks.append(("◆", (BOLD, MAGENTA), "locked"))
     if measured:
-        legend.append("█ now")
-    legend.append("★ best core: lock and run use it")
-    return paint("   ".join(legend) + "   (all values in MHz)", GRAY)
+        marks.append(("█", (heat(0.5),), "now"))
+    marks.append(("★", (BOLD, YELLOW), "best core: lock and run use it"))
+    items = [(f"{mark} {label}", paint(mark, *style) + paint(f" {label}", GRAY)) for mark, style, label in marks]
+    items.append(("(all values in MHz)", paint("(all values in MHz)", GRAY)))
+    columns = max(40, shutil.get_terminal_size((100, 24)).columns) - 1
+    lines, plain, colored = [], "", ""
+    for text, painted in items:
+        if plain and len(plain) + 3 + len(text) > columns:
+            lines.append(colored)
+            plain, colored = "", ""
+        if plain:
+            plain, colored = plain + "   ", colored + "   "
+        plain, colored = plain + text, colored + painted
+    return [*lines, colored]
 
 
 def show_json(cores: list[Core], info: dict, command: str, changed: list[int] | None) -> dict:
