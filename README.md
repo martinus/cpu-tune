@@ -33,7 +33,7 @@ curl -fsSL https://github.com/martinus/cputune/releases/latest/download/cputune 
 
 ```sh
 cputune                      # the cores (best first), the settings, what can make results vary
-cputune -w                   # live view of the core frequencies
+cputune -w                   # live view of the core frequencies (q: quit)
 cputune run -- ./bench       # lock the best core, run ./bench on it, reset
 ```
 
