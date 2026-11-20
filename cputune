@@ -32,7 +32,7 @@ if TYPE_CHECKING:  # only for type hints: typing makes each start slower
     import threading
     from typing import NoReturn
 
-__version__ = "2.4.3"  # increase it for every change: "cputune update" compares versions
+__version__ = "2.5.0"  # increase it for every change: "cputune update" compares versions
 
 # The latest release, not main: raw.githubusercontent.com caches main for 5 minutes, and a
 # release exists only after the tests passed on main.
@@ -65,7 +65,7 @@ benchmarks give stable results.
 look at the machine:
   cputune                       the cores (best first), the settings, and what
                                 can make benchmark results vary
-  cputune -w                    live view of the core frequencies
+  cputune -w                    live view of the core frequencies (q: quit)
   cputune -w --interval 0.5     the same, with an update every 0.5 s (default: 1)
   cputune -w --count 10         the same, and stop after 10 updates
   cputune --now                 also measure the current frequency (1 s)
@@ -828,6 +828,41 @@ def avoid_cpus(cpus, allowed: set[int] | None = None) -> None:
         pass
 
 
+def keys_on(fd: int) -> list:
+    """Read single key presses from the terminal fd, without echo. Ctrl+C still works.
+    Returns the old mode for keys_off."""
+    import termios
+
+    old = termios.tcgetattr(fd)
+    mode = termios.tcgetattr(fd)
+    mode[3] &= ~(termios.ECHO | termios.ICANON)  # lflags
+    mode[6][termios.VMIN], mode[6][termios.VTIME] = 1, 0
+    termios.tcsetattr(fd, termios.TCSANOW, mode)
+    return old
+
+
+def keys_off(fd: int, old: list) -> None:
+    import termios
+
+    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def wait_for_quit(keys: int | None, deadline: float) -> bool:
+    """Wait until deadline (time.monotonic). True when q was pressed on keys (a terminal fd)."""
+    import select
+
+    while (wait := deadline - time.monotonic()) > 0:
+        if keys is None:
+            time.sleep(wait)
+        elif select.select([keys], [], [], wait)[0]:
+            data = os.read(keys, 64)
+            if b"q" in data.lower():
+                return True
+            if not data:  # the terminal is gone: only the deadline counts
+                keys = None
+    return False
+
+
 def cmd_watch(args: argparse.Namespace) -> None:
     """A live view. To keep its own load low, watch wakes up once per interval,
     reads only the files that change, and redraws only the lines that change."""
@@ -849,6 +884,8 @@ def cmd_watch(args: argparse.Namespace) -> None:
         os.nice(19 - os.nice(0))  # lowest priority
     except OSError:
         pass
+    keys = sys.stdin.fileno() if tty and sys.stdin.isatty() else None  # q stops the view
+    old_mode = keys_on(keys) if keys is not None else None
     if tty:
         OUT.write("\033[?1049h\033[?25l")  # alternate screen, hide cursor
     try:
@@ -876,7 +913,8 @@ def cmd_watch(args: argparse.Namespace) -> None:
                 print(json.dumps(data), file=OUT, flush=True)
             else:
                 lines = render_show(cores, info, True, changed)
-                lines.append(paint(f"{time.strftime('%H:%M:%S')}   Ctrl+C to stop", GRAY))
+                stop = "q or Ctrl+C to stop" if keys is not None else "Ctrl+C to stop"
+                lines.append(paint(f"{time.strftime('%H:%M:%S')}   {stop}", GRAY))
                 if not tty:
                     OUT.write("\n".join(lines) + "\n\n")
                 else:
@@ -899,13 +937,15 @@ def cmd_watch(args: argparse.Namespace) -> None:
             if args.count and frames >= args.count:
                 break
             deadline += args.interval
-            if (wait := deadline - time.monotonic()) > 0:
-                time.sleep(wait)
-            else:
+            if deadline <= time.monotonic():
                 deadline = time.monotonic()  # too slow, or the machine was suspended
+            elif wait_for_quit(keys, deadline):
+                break
     except KeyboardInterrupt:
         pass
     finally:
+        if old_mode is not None:
+            keys_off(keys, old_mode)
         reader.close()
         if tty:
             OUT.write("\033[?25h\033[?1049l")

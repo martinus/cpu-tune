@@ -258,6 +258,30 @@ class ShowTest(Case):
                 self.assertEqual(json.loads(lines[1])["command"], "watch")
         self.assertIn("Ctrl+C", self.ok("-w", "--count", "1").stdout)
 
+    def test_watch_stops_on_q(self) -> None:
+        # In a terminal, q stops the live view before the next update, and the terminal mode is restored.
+        import pty
+        import select
+        import termios
+
+        main, child = pty.openpty()
+        self.addCleanup(os.close, main)
+        self.addCleanup(os.close, child)
+        before = termios.tcgetattr(child)
+        env = dict(os.environ, CPUTUNE_ROOT=str(self.root))
+        proc = subprocess.Popen([sys.executable, str(SCRIPT), "-w", "--interval", "60"], env=env,
+                                stdin=child, stdout=child, stderr=child)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        shown = b""
+        while b"q or Ctrl+C to stop" not in shown:
+            if not select.select([main], [], [], 10)[0]:
+                self.fail(f"watch did not show the first update: {shown!r}")
+            shown += os.read(main, 65536)
+        os.write(main, b"q")
+        self.assertEqual(proc.wait(timeout=5), 0)
+        self.assertEqual(termios.tcgetattr(child), before)
+
     def test_notes_of_the_machine(self) -> None:
         fake_sysfs.w(self.root / "proc/11/comm", "tuned")
         fake_sysfs.w(self.root / "proc/12/comm", "tuned-ppd")
